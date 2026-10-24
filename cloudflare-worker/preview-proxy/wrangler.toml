@@ -1,0 +1,66 @@
+# PocketEngineer preview proxy — Cloudflare Worker config.
+#
+# This file is checked in. We run ONE production deployment of this
+# Worker (route `preview.pocketeng.co/*`, KV namespace `TUNNEL_MAP`
+# id below). Backend writes to the same KV id via the
+# `CloudflareKvNamespaceId` SAM parameter in `backend/samconfig.test.toml`
+# — Worker reads, backend writes, the two ids must match. There is no
+# separate test/prod environment today; if we ever add one, give it
+# its own route + DNS + KV namespace and wire the backend stack that
+# targets it to the matching id.
+#
+# Deploy:            wrangler deploy
+# Local tail:        wrangler tail
+# Local dev:         wrangler dev (uses a miniflare KV; set values
+#                    manually with `wrangler kv:key put --local ...`)
+
+name = "pe-preview-proxy"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# No build step. `main` is plain ES-module JavaScript. If we add
+# TypeScript or bundler deps later, drop in an esbuild / rollup
+# pipeline and point `main` at the output.
+
+# ── Route ────────────────────────────────────────────────────────────
+# Workers match on zone-scoped patterns. `preview.pocketeng.co/*`
+# captures every path under that hostname and sends it to this worker.
+# A single DNS "proxied" record for `preview.pocketeng.co` must exist
+# in the zone — type doesn't matter (Cloudflare just needs an entry
+# to attach the orange-cloud proxy to); we use an AAAA pointing at
+# 100:: by convention. See README.
+#
+# IMPORTANT: this must appear BEFORE any `[section]` header in the TOML.
+# Top-level arrays declared after `[vars]` get re-parented under that
+# section and wrangler will refuse to deploy with "no routes
+# configured" ("register a workers.dev subdomain"). Learned the hard
+# way — leaving this comment to save the next person an hour.
+routes = [
+  { pattern = "preview.pocketeng.co/*", zone_name = "pocketeng.co" },
+]
+
+# ── Vars ─────────────────────────────────────────────────────────────
+# PREVIEW_DOMAIN is the apex the per-workspace CNAMEs live under —
+# e.g. `pocketeng.co`. The worker uses it to build
+# `w-<workspaceId>.pocketeng.co` as its fetch target. If unset, the
+# worker derives it from its own hostname's last two labels
+# (preview.pocketeng.co → pocketeng.co), so you can usually omit
+# this for vanilla setups.
+[vars]
+PREVIEW_DOMAIN = "pocketeng.co"
+
+# ── KV binding: workspaceId → tunnelId ──────────────────────────────
+# This `id` is the production `TUNNEL_MAP` namespace. Backend writes
+# to it via the Cloudflare REST API (`CLOUDFLARE_KV_NAMESPACE_ID` env
+# var, set from `CloudflareKvNamespaceId` in
+# `backend/samconfig.test.toml`). If you're running your own fork,
+# create a fresh namespace and replace the id here AND in the backend
+# SAM parameter:
+#   wrangler kv:namespace create TUNNEL_MAP
+[[kv_namespaces]]
+binding = "TUNNEL_MAP"
+id = "4c3d8bb4fc3246f3895041fe916225f0"
+
+# ── Observability ───────────────────────────────────────────────────
+# Log tail: `wrangler tail` from this directory. No metrics needed at
+# this scale; the CF dashboard's worker analytics view covers it.

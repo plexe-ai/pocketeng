@@ -1,0 +1,16 @@
+{
+  "region": "us-east-1",
+  "table": "pe-slack-mappings-prod",
+  "teams": {
+    "T00000000": {
+      "_comment": "Your Slack workspace",
+      "channels": {
+        "C00000001": {
+          "serverId": "00000000-0000-0000-0000-000000000001",
+          "userId": "00000000-0000-0000-0000-0000000000aa",
+          "_comment": "#dev-myproject -> my-workspace"
+        }
+      }
+    }
+  }
+}

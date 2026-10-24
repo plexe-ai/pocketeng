@@ -1,0 +1,2144 @@
+#!/bin/bash
+# Pocket Eng — AI coding agents on your cloud, from anywhere.
+# Sessions run in tmux on EC2, surviving disconnects.
+# Close your laptop, pick up on your phone, or reconnect later.
+#
+# Install:  curl -fsSL https://pocketeng.ai/install | sh
+# Start:    pocketeng login
+# Docs:     https://github.com/vaibs-d/pocketengineer
+
+VERSION="3.2.0"
+CONFIG_DIR="$HOME/.pocketeng"
+LEGACY_DIR="$HOME/.pocket-engineer"
+CONFIG_FILE="$CONFIG_DIR/config"
+SERVERS_DIR="$CONFIG_DIR/servers"
+ACTIVE_FILE="$CONFIG_DIR/active"
+PAIRS_FILE="$CONFIG_DIR/pairs.json"
+WATCHERS_DIR="$CONFIG_DIR/watchers"
+TMUX_SESSION="pocketeng"
+SERVER_OVERRIDE=""
+
+# Colors
+PURPLE='\033[0;35m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+
+migrate_dir() {
+    if [ -d "$LEGACY_DIR" ] && [ ! -d "$CONFIG_DIR" ]; then
+        mv "$LEGACY_DIR" "$CONFIG_DIR"
+    fi
+}
+
+migrate_config() {
+    migrate_dir
+    if [ -f "$CONFIG_FILE" ] && [ ! -d "$SERVERS_DIR" ]; then
+        mkdir -p "$SERVERS_DIR"
+        cp "$CONFIG_FILE" "$SERVERS_DIR/default.conf"
+        echo "default" > "$ACTIVE_FILE"
+    fi
+}
+
+active_profile() {
+    if [ -n "$SERVER_OVERRIDE" ]; then
+        echo "$SERVER_OVERRIDE"
+    elif [ -f "$ACTIVE_FILE" ]; then
+        cat "$ACTIVE_FILE"
+    else
+        echo "default"
+    fi
+}
+
+load_config() {
+    migrate_config
+    local profile="${1:-$(active_profile)}"
+    local pfile="$SERVERS_DIR/${profile}.conf"
+    if [ -f "$pfile" ]; then
+        source "$pfile"
+    elif [ -n "$SERVER_OVERRIDE" ]; then
+        echo -e "${RED}Server '$SERVER_OVERRIDE' not found.${NC}"
+        echo ""
+        cmd_servers
+        exit 1
+    elif [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+    EC2_HOST="${POCKET_ENGINEER_HOST:-${PE_HOST:-}}"
+    EC2_USER="${POCKET_ENGINEER_USER:-${PE_USER:-ec2-user}}"
+    SSH_KEY="${POCKET_ENGINEER_KEY:-${PE_KEY:-$HOME/.ssh/pocketeng.pem}}"
+    WORK_DIR="${POCKET_ENGINEER_DIR:-${PE_DIR:-~/projects}}"
+    EC2_INSTANCE_ID="${PE_INSTANCE_ID:-}"
+    PE_AGENT="${PE_AGENT:-claude}"
+}
+
+save_config() {
+    local profile="${1:-$(active_profile)}"
+    mkdir -p "$SERVERS_DIR"
+    cat > "$SERVERS_DIR/${profile}.conf" << EOF
+# Pocket Eng — server profile: $profile
+PE_HOST="$EC2_HOST"
+PE_USER="$EC2_USER"
+PE_KEY="$SSH_KEY"
+PE_DIR="$WORK_DIR"
+PE_INSTANCE_ID="$EC2_INSTANCE_ID"
+PE_AGENT="${PE_AGENT:-claude}"
+EOF
+    chmod 600 "$SERVERS_DIR/${profile}.conf"
+    cat > "$CONFIG_FILE" << EOF
+# Pocket Eng CLI config (active: $profile)
+PE_HOST="$EC2_HOST"
+PE_USER="$EC2_USER"
+PE_KEY="$SSH_KEY"
+PE_DIR="$WORK_DIR"
+PE_INSTANCE_ID="$EC2_INSTANCE_ID"
+PE_AGENT="${PE_AGENT:-claude}"
+EOF
+    chmod 600 "$CONFIG_FILE"
+    echo "$profile" > "$ACTIVE_FILE"
+}
+
+require_config() {
+    if [ -z "$EC2_HOST" ]; then
+        echo -e "${RED}Not configured.${NC} Run ${BOLD}pocketeng login${NC} or ${BOLD}pocketeng setup${NC} to connect."
+        exit 1
+    fi
+}
+
+# ─── SSH ─────────────────────────────────────────────────────────────────────
+
+ssh_cmd() {
+    ssh -i "$SSH_KEY" \
+        -o StrictHostKeyChecking=no \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=6 \
+        -o ConnectTimeout=10 \
+        "$EC2_USER@$EC2_HOST" "$@"
+}
+
+# ─── Login: Browser auth + workspace sync ─────────────────────────────────
+
+API_BASE="${POCKETENG_API_BASE:-https://l72swowr9e.execute-api.us-east-1.amazonaws.com/prod}"
+TOKEN_FILE="$CONFIG_DIR/token"
+
+cmd_login() {
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Sign in"
+    echo ""
+
+    # Check if already logged in
+    if [ -f "$TOKEN_FILE" ]; then
+        local existing_token
+        existing_token=$(cat "$TOKEN_FILE")
+        local check
+        check=$(curl -sf -H "Authorization: Bearer $existing_token" "$API_BASE/servers" 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            echo -e "  ${GREEN}Already signed in.${NC}"
+            echo ""
+            read -p "  Re-sync workspaces? [Y/n] " resync
+            resync="${resync:-y}"
+            if [[ "$resync" =~ ^[Yy] ]]; then
+                _sync_workspaces "$existing_token"
+            fi
+            return
+        fi
+        echo -e "  ${DIM}Session expired, signing in again...${NC}"
+        echo ""
+    fi
+
+    # Start a local HTTP server and open the browser for auth
+    local token
+    token=$(_browser_auth)
+
+    if [ -z "$token" ]; then
+        echo -e "  ${RED}Sign-in failed or timed out.${NC}"
+        return 1
+    fi
+
+    # Verify the token
+    local verify
+    verify=$(curl -sf -H "Authorization: Bearer $token" "$API_BASE/servers" 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        echo -e "  ${RED}Sign-in failed. Please try again.${NC}"
+        return 1
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    echo "$token" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    echo -e "  ${GREEN}Signed in!${NC}"
+    echo ""
+
+    _sync_workspaces "$token"
+}
+
+# Start a local HTTP server, open browser for auth, wait for token callback
+_browser_auth() {
+    local port
+    port=$((10000 + RANDOM % 50000))
+
+    local token_file
+    token_file=$(mktemp)
+
+    # Start a tiny Python HTTP server that waits for the token via redirect
+    python3 -c "
+import http.server, threading, signal
+from urllib.parse import urlparse, parse_qs
+
+SUCCESS_HTML = b'''<!DOCTYPE html><html><head><title>Pocket Eng</title>
+<style>body{background:#0a0a0f;color:#e5e5e5;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.ok{text-align:center}.ok .check{width:48px;height:48px;border-radius:50%;background:rgba(34,197,94,.1);display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
+h1{font-size:18px;margin:0 0 8px}p{color:#888;font-size:14px;margin:0}</style></head>
+<body><div class=\"ok\"><div class=\"check\"><svg width=\"24\" height=\"24\" fill=\"none\" viewBox=\"0 0 24 24\" stroke=\"#22c55e\" stroke-width=\"2\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M5 13l4 4L19 7\"/></svg></div>
+<h1>CLI Connected</h1><p>You can close this tab and return to your terminal.</p></div></body></html>'''
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        token = params.get('token', [''])[0]
+        if parsed.path == '/callback' and token:
+            with open('$token_file', 'w') as f:
+                f.write(token)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(SUCCESS_HTML)
+            threading.Thread(target=self.server.shutdown).start()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(('127.0.0.1', $port), Handler)
+signal.alarm(120)
+signal.signal(signal.SIGALRM, lambda *a: server.shutdown())
+server.serve_forever()
+" &
+    local server_pid=$!
+
+    # Give the server a moment to start
+    sleep 0.3
+
+    local url="https://console.pocketeng.ai/auth/cli?port=$port"
+
+    echo -e "  Opening browser to sign in..." >&2
+    echo "" >&2
+    if command -v open &>/dev/null; then
+        open "$url"
+    elif command -v xdg-open &>/dev/null; then
+        xdg-open "$url"
+    else
+        echo -e "  Open this URL in your browser:" >&2
+        echo -e "  ${BOLD}$url${NC}" >&2
+        echo "" >&2
+    fi
+
+    echo -e "  ${DIM}Waiting for sign-in...${NC}" >&2
+
+    # Wait for the server to finish (token received or timeout)
+    wait $server_pid 2>/dev/null
+
+    local token
+    token=$(cat "$token_file" 2>/dev/null)
+    rm -f "$token_file"
+
+    echo "$token"
+}
+
+_sync_workspaces() {
+    local token="$1"
+    echo -n "  Syncing workspaces... "
+
+    local response
+    response=$(curl -sf -H "Authorization: Bearer $token" "$API_BASE/servers" 2>/dev/null)
+
+    if [ $? -ne 0 ] || [ -z "$response" ]; then
+        echo -e "${YELLOW}Failed to fetch workspaces.${NC}"
+        return 1
+    fi
+
+    local count
+    count=$(echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+servers = data.get('servers', [])
+active = [s for s in servers if s.get('instanceState') != 'terminated']
+print(len(active))
+" 2>/dev/null)
+
+    echo -e "${GREEN}Found $count workspace(s)${NC}"
+    echo ""
+
+    echo "$response" | python3 -c "
+import sys, json, os
+
+data = json.load(sys.stdin)
+servers = data.get('servers', [])
+config_dir = os.path.expanduser('~/.pocketeng')
+servers_dir = os.path.join(config_dir, 'servers')
+os.makedirs(servers_dir, exist_ok=True)
+
+first_profile = None
+for s in servers:
+    if s.get('instanceState') == 'terminated':
+        continue
+    sid = s['serverId']
+    ip = s.get('publicIp', '')
+    if not ip:
+        continue
+
+    label = s.get('label', '') or ip
+    profile = label.lower().replace(' ', '-').replace('/', '-')[:30]
+    profile = ''.join(c for c in profile if c.isalnum() or c == '-')
+    if not profile:
+        profile = sid[:8]
+
+    if first_profile is None:
+        first_profile = profile
+
+    key_path = ''
+    ssh_key = s.get('sshPrivateKey', '')
+    if ssh_key:
+        key_file = os.path.join(config_dir, f'pe-{sid[:8]}.pem')
+        with open(key_file, 'w') as f:
+            f.write(ssh_key)
+        os.chmod(key_file, 0o600)
+        key_path = key_file
+
+    ssh_user = s.get('sshUser', 'ec2-user') or 'ec2-user'
+    server_agents = s.get('agents', ['claude'])
+    primary_agent = server_agents[0] if server_agents else 'claude'
+
+    conf = f'''# Pocket Eng — server profile: {profile}
+PE_HOST=\"{ip}\"
+PE_USER=\"{ssh_user}\"
+PE_KEY=\"{key_path}\"
+PE_DIR=\"~/projects\"
+PE_INSTANCE_ID=\"{s.get('instanceId', '')}\"
+PE_AGENT=\"{primary_agent}\"
+'''
+    conf_path = os.path.join(servers_dir, f'{profile}.conf')
+    with open(conf_path, 'w') as f:
+        f.write(conf)
+    os.chmod(conf_path, 0o600)
+    print(f'  {profile:20s} {ip:16s} {s.get(\"instanceState\", \"\")}')
+
+active_file = os.path.join(config_dir, 'active')
+if first_profile and not os.path.exists(active_file):
+    with open(active_file, 'w') as f:
+        f.write(first_profile)
+    print(f'')
+    print(f'  Active: {first_profile}')
+" 2>/dev/null
+
+    echo ""
+    echo -e "  Run ${BOLD}pocketeng${NC} to start, or ${BOLD}pocketeng servers${NC} to see all."
+}
+
+# ─── Setup: Connect to existing server ────────────────────────────────────
+
+cmd_setup() {
+    local PROFILE_NAME="" INPUT_HOST="" INPUT_USER="" INPUT_KEY="" INPUT_DIR=""
+    shift 2>/dev/null || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name) PROFILE_NAME="$2"; shift 2 ;;
+            --name=*) PROFILE_NAME="${1#*=}"; shift ;;
+            --host) INPUT_HOST="$2"; shift 2 ;;
+            --host=*) INPUT_HOST="${1#*=}"; shift ;;
+            --key) INPUT_KEY="$2"; shift 2 ;;
+            --key=*) INPUT_KEY="${1#*=}"; shift ;;
+            --user) INPUT_USER="$2"; shift 2 ;;
+            --user=*) INPUT_USER="${1#*=}"; shift ;;
+            --dir) INPUT_DIR="$2"; shift 2 ;;
+            --dir=*) INPUT_DIR="${1#*=}"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Connect to server"
+    echo ""
+
+    if [ -n "$INPUT_HOST" ] && [ -n "$INPUT_KEY" ]; then
+        PROFILE_NAME="${PROFILE_NAME:-default}"
+        EC2_HOST="$INPUT_HOST"
+        EC2_USER="${INPUT_USER:-ec2-user}"
+        SSH_KEY="$INPUT_KEY"
+        WORK_DIR="${INPUT_DIR:-~/projects}"
+    else
+        if [ -z "$PROFILE_NAME" ]; then
+            read -p "  Server name [default]: " PROFILE_NAME
+            PROFILE_NAME="${PROFILE_NAME:-default}"
+        fi
+        echo ""
+
+        if [ -z "$INPUT_HOST" ]; then
+            read -p "  Host (IP or hostname): " INPUT_HOST
+        fi
+        [ -z "$INPUT_HOST" ] && echo "Host is required." && exit 1
+        EC2_HOST="$INPUT_HOST"
+
+        if [ -z "$INPUT_USER" ]; then
+            read -p "  SSH user [ec2-user]: " INPUT_USER
+        fi
+        EC2_USER="${INPUT_USER:-ec2-user}"
+
+        local default_key="$HOME/.ssh/pocketeng.pem"
+        if [ -z "$INPUT_KEY" ]; then
+            read -p "  SSH key path [$default_key]: " INPUT_KEY
+        fi
+        SSH_KEY="${INPUT_KEY:-$default_key}"
+        [ ! -f "$SSH_KEY" ] && echo -e "  ${YELLOW}Warning: Key not found at $SSH_KEY${NC}"
+
+        if [ -z "$INPUT_DIR" ]; then
+            read -p "  Working directory [~/projects]: " INPUT_DIR
+        fi
+        WORK_DIR="${INPUT_DIR:-~/projects}"
+    fi
+
+    save_config "$PROFILE_NAME"
+    echo ""
+    echo -n "  Testing connection... "
+    if ! ssh_cmd -o BatchMode=yes "echo ok" &>/dev/null; then
+        echo -e "${YELLOW}Could not connect${NC}"
+        return
+    fi
+    echo -e "${GREEN}Connected!${NC}"
+
+    local AGENT_BIN
+    AGENT_BIN=$(_agent_cmd)
+    echo -n "  Checking for $AGENT_BIN... "
+    local AGENT_PATH
+    AGENT_PATH=$(ssh_cmd "bash -l -c 'which $AGENT_BIN 2>/dev/null'" 2>/dev/null)
+    if [ -n "$AGENT_PATH" ]; then
+        echo -e "${GREEN}found${NC} ${DIM}($AGENT_PATH)${NC}"
+        echo ""
+        echo -e "  Run ${BOLD}pocketeng${NC} to start."
+    else
+        echo -e "${YELLOW}not found${NC}"
+        echo ""
+        read -p "  Install $(_agent_display_name) on the server now? [Y/n]: " do_install
+        if [[ ! "${do_install}" =~ ^[Nn] ]]; then
+            _agent_install
+            echo ""
+            echo -e "  ${GREEN}Done!${NC} Run ${BOLD}pocketeng${NC} to start."
+        else
+            echo -e "  Run ${BOLD}npm install -g $(_agent_npm_package)${NC} on the server first."
+        fi
+    fi
+}
+
+# ─── EC2 State ───────────────────────────────────────────────────────────────
+
+_start_ec2_if_stopped() {
+    [ -z "$EC2_INSTANCE_ID" ] && return 1
+    command -v aws &>/dev/null || return 1
+
+    local state
+    state=$(aws ec2 describe-instances --instance-ids "$EC2_INSTANCE_ID" \
+        --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)
+
+    case "$state" in
+        running) return 0 ;;
+        stopped)
+            echo -e "  ${YELLOW}EC2 instance is stopped.${NC}"
+            read -p "  Start it? [Y/n] " _choice
+            _choice="${_choice:-y}"
+            [[ "$_choice" =~ ^[Yy] ]] || return 1
+
+            echo -n "  Starting"
+            aws ec2 start-instances --instance-ids "$EC2_INSTANCE_ID" &>/dev/null
+            for _ in $(seq 1 24); do
+                sleep 5; echo -n "."
+                local new_state new_ip
+                new_state=$(aws ec2 describe-instances --instance-ids "$EC2_INSTANCE_ID" \
+                    --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)
+                new_ip=$(aws ec2 describe-instances --instance-ids "$EC2_INSTANCE_ID" \
+                    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null)
+                if [ "$new_state" = "running" ] && [ -n "$new_ip" ] && [ "$new_ip" != "None" ]; then
+                    echo -e " ${GREEN}running${NC}"
+                    if [ "$new_ip" != "$EC2_HOST" ]; then
+                        echo -e "  ${DIM}IP updated: $EC2_HOST → $new_ip${NC}"
+                        EC2_HOST="$new_ip"
+                        save_config "$(active_profile)"
+                    fi
+                    return 0
+                fi
+            done
+            echo -e " ${RED}timed out${NC}"
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# ─── Agent Helpers ────────────────────────────────────────────────────────────
+
+_agent_cmd() {
+    case "${PE_AGENT:-claude}" in
+        claude)   echo "claude" ;;
+        opencode) echo "opencode" ;;
+        codex)    echo "codex" ;;
+        cursor)   echo "agent" ;;
+        *)        echo "claude" ;;
+    esac
+}
+
+_agent_display_name() {
+    case "${PE_AGENT:-claude}" in
+        claude)   echo "Claude Code" ;;
+        opencode) echo "OpenCode" ;;
+        codex)    echo "Codex" ;;
+        cursor)   echo "Cursor" ;;
+        *)        echo "${PE_AGENT}" ;;
+    esac
+}
+
+_agent_session_base() {
+    # Returns the base dir where the agent stores sessions (e.g. ~/.claude or ~/.cursor)
+    case "${PE_AGENT:-claude}" in
+        cursor)  echo "$HOME/.cursor" ;;
+        *)       echo "$HOME/.claude" ;;
+    esac
+}
+
+_agent_session_dir() {
+    # Returns the local session directory for a project path hash.
+    # Claude: ~/.claude/projects/<hash>/ (hash has leading dash: -Users-foo)
+    # Cursor: ~/.cursor/projects/<hash>/agent-transcripts/ (no leading dash: Users-foo)
+    # Codex:  ~/.codex/sessions/ (global, date-based — not project-scoped)
+    local hash="$1"
+    case "${PE_AGENT:-claude}" in
+        cursor)
+            local cursor_hash="${hash#-}"
+            echo "$HOME/.cursor/projects/${cursor_hash}/agent-transcripts"
+            ;;
+        codex)
+            echo "$HOME/.codex/sessions"
+            ;;
+        *)  echo "$HOME/.claude/projects/${hash}" ;;
+    esac
+}
+
+_agent_remote_session_dir() {
+    # Returns the remote (EC2) session directory relative to $HOME.
+    # Claude: .claude/projects/<hash>/ (hash has leading dash)
+    # Cursor: .cursor/projects/<hash>/agent-transcripts/ (no leading dash)
+    # Codex:  .codex/sessions/ (global, same structure as local)
+    local hash="$1"
+    case "${PE_AGENT:-claude}" in
+        cursor)
+            local cursor_hash="${hash#-}"
+            echo ".cursor/projects/${cursor_hash}/agent-transcripts"
+            ;;
+        codex)
+            echo ".codex/sessions"
+            ;;
+        *)  echo ".claude/projects/${hash}" ;;
+    esac
+}
+
+_agent_find_latest_session() {
+    # Finds the latest session .jsonl in the agent's session dir.
+    # Claude: flat dir of .jsonl files
+    # Cursor: nested <uuid>/<uuid>.jsonl structure
+    # Codex:  recursive date-based dirs, filtered by project cwd.
+    #         $2 is the real project path (required for codex to filter by cwd).
+    local session_dir="$1"
+    local project_path="${2:-}"
+    [ -d "$session_dir" ] || return 1
+    case "${PE_AGENT:-claude}" in
+        cursor)
+            find "$session_dir" -name '*.jsonl' -type f 2>/dev/null \
+                | xargs ls -t 2>/dev/null | head -1
+            ;;
+        codex)
+            # Codex sessions are global; filter by cwd in session_meta
+            local candidates
+            candidates=$(find "$session_dir" -name '*.jsonl' -type f 2>/dev/null \
+                | xargs ls -t 2>/dev/null)
+            if [ -n "$project_path" ]; then
+                local f
+                while IFS= read -r f; do
+                    [ -z "$f" ] && continue
+                    if head -1 "$f" 2>/dev/null | grep -q "\"cwd\":\"${project_path}"; then
+                        echo "$f"
+                        return 0
+                    fi
+                done <<< "$candidates"
+            else
+                echo "$candidates" | head -1
+            fi
+            ;;
+        *)
+            ls -t "$session_dir"/*.jsonl 2>/dev/null | grep -v '/agent-' | head -1
+            ;;
+    esac
+}
+
+_agent_session_id_from_file() {
+    # Extracts the session ID from a session file path.
+    # Claude: /path/<uuid>.jsonl -> <uuid>
+    # Cursor: /path/<uuid>/<uuid>.jsonl -> <uuid>
+    # Codex:  /path/rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl -> <uuid>
+    local file="$1"
+    local base
+    base=$(basename "$file" .jsonl)
+    case "${PE_AGENT:-claude}" in
+        codex)
+            # Extract UUID from rollout-<timestamp>-<uuid>
+            echo "$base" | grep -oE '[0-9a-f]{7,8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            ;;
+        *)
+            echo "$base"
+            ;;
+    esac
+}
+
+_agent_npm_package() {
+    case "${PE_AGENT:-claude}" in
+        claude)   echo "@anthropic-ai/claude-code" ;;
+        opencode) echo "opencode-ai@latest" ;;
+        codex)    echo "@openai/codex" ;;
+        cursor)   echo "" ;;
+        *)        echo "@anthropic-ai/claude-code" ;;
+    esac
+}
+
+_agent_install() {
+    local AGENT_NAME AGENT_PKG
+    AGENT_NAME=$(_agent_display_name)
+    AGENT_PKG=$(_agent_npm_package)
+
+    echo -e "  ${DIM}Installing $AGENT_NAME on server...${NC}"
+    echo ""
+
+    if [ "${PE_AGENT:-claude}" = "cursor" ]; then
+        ssh_cmd "bash -l -s" << 'INSTALL_EOF'
+set -e
+echo "==> Installing Cursor CLI..."
+curl -fsSL https://cursor.com/install | bash
+echo "==> Done!"
+INSTALL_EOF
+        return
+    fi
+
+    ssh_cmd "bash -l -s" << INSTALL_EOF
+set -e
+if ! command -v node >/dev/null 2>&1; then
+  echo "==> node not found — installing via nvm..."
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash 2>&1
+  export NVM_DIR="\$HOME/.nvm"
+  [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh"
+  nvm install --lts
+else
+  echo "==> node \$(node --version) found"
+  export NVM_DIR="\$HOME/.nvm"
+  [ -s "\$NVM_DIR/nvm.sh" ] && . "\$NVM_DIR/nvm.sh" --no-use 2>/dev/null || true
+  NVM_BIN=\$(ls -d \$HOME/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1)
+  [ -n "\$NVM_BIN" ] && export PATH="\$NVM_BIN:\$PATH"
+fi
+echo "==> Installing $AGENT_NAME..."
+npm install -g $AGENT_PKG
+echo "==> Done!"
+INSTALL_EOF
+}
+
+# ─── Session Commands ────────────────────────────────────────────────────────
+
+cmd_interactive() {
+    require_config
+    local AGENT_BIN AGENT_NAME
+    AGENT_BIN=$(_agent_cmd)
+    AGENT_NAME=$(_agent_display_name)
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — $AGENT_NAME"
+    echo -e "${DIM}Close laptop anytime — session keeps running on EC2.${NC}"
+    echo -e "${DIM}Reattach: pocketeng attach | Phone: open Pocket Eng app${NC}"
+    echo ""
+
+    # Auto-install agent if missing
+    local AGENT_PATH
+    AGENT_PATH=$(ssh_cmd "bash -l -c 'which $AGENT_BIN 2>/dev/null'" 2>/dev/null)
+    if [ -z "$AGENT_PATH" ]; then
+        echo -e "  ${YELLOW}$AGENT_NAME not found on server.${NC}"
+        echo ""
+        _agent_install
+        echo ""
+    else
+        local key_file key_label key_prompt
+        case "${PE_AGENT:-claude}" in
+            claude)   key_file="~/.pocketeng/anthropic_key"; key_label="Anthropic API key"; key_prompt="sk-ant-..." ;;
+            codex)    key_file="~/.pocketeng/openai_key";    key_label="OpenAI API key";    key_prompt="sk-..." ;;
+            cursor)   key_file="~/.pocketeng/cursor_key";    key_label="Cursor API key";    key_prompt="crsr_..." ;;
+            *)        key_file="" ;;
+        esac
+        if [ -n "$key_file" ]; then
+            local key_exists
+            key_exists=$(ssh_cmd "[ -f $key_file ] && echo yes || echo no" 2>/dev/null)
+            if [ "$key_exists" != "yes" ]; then
+                echo -e "  ${YELLOW}$key_label not found on server.${NC}"
+                echo -ne "  Enter your API key ($key_prompt): "
+                local API_KEY
+                read -r API_KEY
+                if [ -n "$API_KEY" ]; then
+                    ssh_cmd "mkdir -p ~/.pocketeng && chmod 700 ~/.pocketeng && echo '$API_KEY' > $key_file && chmod 600 $key_file" 2>/dev/null
+                    echo -e "  ${GREEN}API key saved.${NC}"
+                    echo ""
+                fi
+            fi
+        fi
+    fi
+
+    ssh_cmd -t "tmux kill-session -t $TMUX_SESSION 2>/dev/null; tmux new-session -s $TMUX_SESSION -c $WORK_DIR 'bash -l -c \"$AGENT_BIN\" || { echo; echo \"[agent exited - press Enter to close]\"; read; }'"
+}
+
+cmd_attach() {
+    require_config
+    local tmux_state
+    tmux_state=$(ssh_cmd "tmux has-session -t $TMUX_SESSION 2>/dev/null && echo RUNNING || echo STOPPED" 2>/dev/null)
+
+    if [ -z "$tmux_state" ]; then
+        echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Cannot reach $EC2_HOST"
+        echo ""
+        if _start_ec2_if_stopped; then
+            echo -n "  Waiting for SSH"
+            for _ in $(seq 1 12); do
+                sleep 5; echo -n "."
+                tmux_state=$(ssh_cmd "tmux has-session -t $TMUX_SESSION 2>/dev/null && echo RUNNING || echo STOPPED" 2>/dev/null)
+                [ -n "$tmux_state" ] && break
+            done
+            echo ""
+        fi
+    fi
+
+    if [ "$tmux_state" = "RUNNING" ]; then
+        echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Reattaching..."
+        ssh_cmd -t "tmux attach-session -t $TMUX_SESSION"
+    else
+        echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — No active session."
+        echo ""
+        read -p "  Start a new session? [Y/n] " choice
+        choice="${choice:-y}"
+        [[ "$choice" =~ ^[Yy] ]] && cmd_interactive
+    fi
+}
+
+# ─── Workspace Commands ──────────────────────────────────────────────────────
+
+cmd_servers() {
+    migrate_config
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Workspaces"
+    echo ""
+    local current
+    current=$(active_profile)
+    if [ ! -d "$SERVERS_DIR" ] || [ -z "$(ls "$SERVERS_DIR"/*.conf 2>/dev/null)" ]; then
+        echo -e "  ${DIM}No workspaces configured. Run ${NC}${BOLD}pocketeng login${NC}${DIM} or ${NC}${BOLD}pocketeng setup${NC}"
+        echo ""
+        return
+    fi
+    for f in "$SERVERS_DIR"/*.conf; do
+        local name
+        name=$(basename "$f" .conf)
+        local _srv_host _srv_agent
+        _srv_host=$(grep '^PE_HOST=' "$f" | head -1 | cut -d'"' -f2)
+        _srv_agent=$(grep '^PE_AGENT=' "$f" | head -1 | cut -d'"' -f2)
+        _srv_host="${_srv_host:-unknown}"
+        _srv_agent="${_srv_agent:-claude}"
+        if [ "$name" = "$current" ]; then
+            echo -e "  ${GREEN}●${NC} ${BOLD}$name${NC}$(printf '%*s' $((16 - ${#name})) '')$_srv_host  ${DIM}[$_srv_agent]${NC}  ${GREEN}(active)${NC}"
+        else
+            echo -e "    $name$(printf '%*s' $((16 - ${#name})) '')$_srv_host  ${DIM}[$_srv_agent]${NC}"
+        fi
+    done
+    echo ""
+    echo -e "  ${DIM}Switch: pocketeng switch <name>${NC}"
+    echo ""
+}
+
+cmd_switch() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo "Usage: pocketeng switch <name>"
+        echo ""
+        cmd_servers
+        exit 1
+    fi
+    migrate_config
+    local pfile="$SERVERS_DIR/${target}.conf"
+    if [ ! -f "$pfile" ]; then
+        echo -e "${RED}Workspace '$target' not found.${NC}"
+        echo ""
+        cmd_servers
+        exit 1
+    fi
+    source "$pfile"
+    EC2_HOST="${PE_HOST:-}"
+    EC2_USER="${PE_USER:-ec2-user}"
+    SSH_KEY="${PE_KEY:-$HOME/.ssh/pocketeng.pem}"
+    WORK_DIR="${PE_DIR:-~/projects}"
+    save_config "$target"
+    echo -e "${GREEN}Switched to ${BOLD}$target${NC} ${DIM}($EC2_HOST)${NC}"
+    echo ""
+    echo -n "  Testing connection... "
+    if ssh_cmd -o BatchMode=yes "echo ok" &>/dev/null; then
+        echo -e "${GREEN}Connected!${NC}"
+    else
+        echo -e "${YELLOW}Could not connect${NC}"
+    fi
+}
+
+# ─── Sync core: one-shot local → cloud mirror ─────────────────────────────
+#
+# Shared between `handoff` (one-shot) and `sync` (continuous). Syncs:
+#   1. Project code via rsync (respecting common ignores)
+#   2. The latest Claude Code session .jsonl for this dir
+# Takes: <local_dir>. Uses the currently-loaded EC2_* vars from load_config.
+# Returns 0 on success, non-zero on failure. Silent unless $1 arg is "verbose".
+
+_do_sync_once() {
+    local PROJECT_DIR="$1"
+    local VERBOSE="${2:-}"
+    # Resolve the physical path — macOS aliases /tmp → /private/tmp, and
+    # claude writes its session file under the REAL cwd. If we don't match
+    # it, the .jsonl sync silently no-ops.
+    local PROJECT_DIR_REAL
+    PROJECT_DIR_REAL=$(cd -- "$PROJECT_DIR" 2>/dev/null && pwd -P) || PROJECT_DIR_REAL="$PROJECT_DIR"
+    local PROJECT_NAME
+    PROJECT_NAME=$(basename "$PROJECT_DIR_REAL")
+
+    # Expand ~ in WORK_DIR so the rsync target is absolute
+    local work_dir_expanded="${WORK_DIR/#\~/$HOME}"
+    # If WORK_DIR was literally "~/projects" we still want remote-relative
+    local REMOTE_PROJECT="$WORK_DIR/$PROJECT_NAME"
+
+    ssh_cmd "mkdir -p $REMOTE_PROJECT" 2>/dev/null || return 1
+
+    local rsync_quiet="-q"
+    [ "$VERBOSE" = "verbose" ] && rsync_quiet="-v"
+
+    rsync -az $rsync_quiet --delete \
+        --exclude=.git --exclude=node_modules --exclude=.build \
+        --exclude=DerivedData --exclude=.DS_Store --exclude=__pycache__ \
+        --exclude='*.pyc' --exclude=.venv --exclude=venv --exclude=.env \
+        --exclude=dist --exclude=.next --exclude=.claude --exclude=build \
+        --exclude=target --exclude=Pods --exclude='*.egg-info' \
+        --exclude='*.log' --exclude=.swiftpm --exclude=.aws-sam \
+        --max-size='50m' \
+        -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+        "$PROJECT_DIR_REAL/" "$EC2_USER@$EC2_HOST:$REMOTE_PROJECT/" 2>/dev/null || return 1
+
+    # Session .jsonl sync. Pass "skip-sessions" as $2 to skip (used by
+    # the initial foreground sync so we don't upload 15 old 60MB files).
+    # The daemon handles ongoing session sync — it only ships files that
+    # changed since the last poll, so old sessions are never touched.
+    [ "${VERBOSE}" = "skip-sessions" ] && return 0
+
+    local LOCAL_HASH SESSION_DIR
+    LOCAL_HASH=$(echo "$PROJECT_DIR_REAL" | sed 's|/|-|g')
+    SESSION_DIR=$(_agent_session_dir "$LOCAL_HASH")
+
+    [ -d "$SESSION_DIR" ] || return 0
+
+    # Resolve the remote project's absolute path for the session dir hash.
+    local RESOLVED_PATH REMOTE_HASH REMOTE_SESSION_DIR
+    RESOLVED_PATH=$(ssh_cmd "cd $REMOTE_PROJECT && pwd" 2>/dev/null) || return 1
+    REMOTE_HASH=$(echo "$RESOLVED_PATH" | sed 's|/|-|g')
+    REMOTE_SESSION_DIR=$(_agent_remote_session_dir "$REMOTE_HASH")
+    ssh_cmd "mkdir -p ~/$REMOTE_SESSION_DIR" 2>/dev/null
+
+    # Find the most recently modified .jsonl (the active session). Only
+    # sync this one file — not the entire history.
+    local SESSION_FILE sid pair_hash
+    SESSION_FILE=$(_agent_find_latest_session "$SESSION_DIR" "$PROJECT_DIR_REAL")
+    [ -z "$SESSION_FILE" ] && return 0
+
+    sid=$(_agent_session_id_from_file "$SESSION_FILE")
+
+    # Each agent has different session file layout on disk
+    if [ "${PE_AGENT:-claude}" = "cursor" ]; then
+        # Cursor: nested <uuid>/<uuid>.jsonl
+        ssh_cmd "mkdir -p ~/$REMOTE_SESSION_DIR/$sid" 2>/dev/null
+        scp -q -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            "$SESSION_FILE" \
+            "$EC2_USER@$EC2_HOST:$REMOTE_SESSION_DIR/$sid/$sid.jsonl" 2>/dev/null || return 1
+
+        # Cursor also keeps the *actual* conversation state in a SQLite chat
+        # store at ~/.cursor/chats/<md5(abs_cwd)>/<sid>/store.db. This — not
+        # the .jsonl — is what `agent --resume <sid>` reads on the EC2 side,
+        # so syncing only the transcript leaves the resumed session with no
+        # prior context. (Fixes the "no earlier message that defines 'it'"
+        # bug when a laptop-created cursor session is followed up from the
+        # web/iOS app.)
+        #
+        # The cwd hash is md5 of the absolute path; it differs between
+        # laptop ($PROJECT_DIR_REAL) and EC2 ($RESOLVED_PATH) because the
+        # paths are different.
+        local LOCAL_MD5 REMOTE_MD5 LOCAL_CHAT_SID_DIR
+        LOCAL_MD5=$(printf '%s' "$PROJECT_DIR_REAL" | openssl md5 2>/dev/null | awk '{print $NF}')
+        REMOTE_MD5=$(printf '%s' "$RESOLVED_PATH"   | openssl md5 2>/dev/null | awk '{print $NF}')
+        LOCAL_CHAT_SID_DIR="$HOME/.cursor/chats/$LOCAL_MD5/$sid"
+        if [ -n "$LOCAL_MD5" ] && [ -n "$REMOTE_MD5" ] && [ -f "$LOCAL_CHAT_SID_DIR/store.db" ]; then
+            ssh_cmd "mkdir -p ~/.cursor/chats/$REMOTE_MD5/$sid" 2>/dev/null
+            scp -q -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                "$LOCAL_CHAT_SID_DIR/store.db" \
+                "$EC2_USER@$EC2_HOST:.cursor/chats/$REMOTE_MD5/$sid/store.db" 2>/dev/null || return 1
+            # SQLite WAL + SHM sidecars (exist only when a writer has the
+            # DB open). Best-effort: a missing/failed sidecar copy is fine —
+            # SQLite will recreate them on open.
+            for _ext in store.db-wal store.db-shm; do
+                if [ -f "$LOCAL_CHAT_SID_DIR/$_ext" ]; then
+                    scp -q -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                        "$LOCAL_CHAT_SID_DIR/$_ext" \
+                        "$EC2_USER@$EC2_HOST:.cursor/chats/$REMOTE_MD5/$sid/$_ext" 2>/dev/null
+                fi
+            done
+        fi
+    elif [ "${PE_AGENT:-claude}" = "codex" ]; then
+        # Codex: preserve date-based dir structure (YYYY/MM/DD/rollout-*.jsonl)
+        local session_base_local="$HOME/.codex/sessions"
+        local rel_path="${SESSION_FILE#${session_base_local}/}"
+        local rel_dir
+        rel_dir=$(dirname "$rel_path")
+        ssh_cmd "mkdir -p ~/$REMOTE_SESSION_DIR/$rel_dir" 2>/dev/null
+        scp -q -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            "$SESSION_FILE" \
+            "$EC2_USER@$EC2_HOST:$REMOTE_SESSION_DIR/$rel_path" 2>/dev/null || return 1
+    else
+        # Claude: flat <uuid>.jsonl
+        scp -q -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            "$SESSION_FILE" \
+            "$EC2_USER@$EC2_HOST:$REMOTE_SESSION_DIR/$sid.jsonl" 2>/dev/null || return 1
+    fi
+
+    pair_hash=$(_pair_hash "$PROJECT_DIR")
+    mkdir -p "$CONFIG_DIR/watchers" 2>/dev/null
+    echo "$sid" > "$CONFIG_DIR/watchers/${pair_hash}.sid" 2>/dev/null
+
+    # Register in the backend so the phone sees it (fire-and-forget).
+    ( _register_synced_session_api "$sid" "$RESOLVED_PATH" \
+        "$REMOTE_HASH" "$PROJECT_NAME" >&2 ) &
+
+    return 0
+}
+
+# POST a session-register request to the backend chat API. The backend will
+# read the .jsonl from the EC2 via SSH, parse it, and write the session +
+# message rows to DynamoDB so the iOS / web app's Sessions tab picks it up.
+#
+# Args: <session_id> <remote_worktree_path> <remote_jsonl_dir_hash> <project_name>
+# Uses: $TOKEN_FILE, $API_BASE, current loaded profile (server id is needed).
+#
+# Logs all errors to stderr — caller (the daemon) redirects stderr to its
+# log file so failures are visible. Returns 0 on success, non-zero on any
+# error so callers know to retry.
+#
+# Idempotent — backend handles "already registered, just check for new turns".
+_register_synced_session_api() {
+    local sid="$1"
+    local remote_worktree="$2"
+    local remote_hash="$3"
+    local project_name="$4"
+
+    if [ ! -f "$TOKEN_FILE" ]; then
+        echo "[$(date -u +%FT%TZ)] register-session: no token file at $TOKEN_FILE — run 'pocketeng login'" >&2
+        return 1
+    fi
+    local token
+    token=$(cat "$TOKEN_FILE" 2>/dev/null)
+    if [ -z "$token" ]; then
+        echo "[$(date -u +%FT%TZ)] register-session: token file empty" >&2
+        return 1
+    fi
+
+    # Look up the serverId for the active profile. Cached per profile so we
+    # don't hit /servers on every sync cycle.
+    local profile server_id_cache server_id
+    profile=$(active_profile)
+    server_id_cache="$CONFIG_DIR/servers/${profile}.serverid"
+    if [ -f "$server_id_cache" ]; then
+        server_id=$(cat "$server_id_cache" 2>/dev/null)
+    fi
+    if [ -z "$server_id" ]; then
+        # Use plain curl (not -f) so we can capture an error body for
+        # diagnostics on auth failure.
+        local servers_response http_status
+        servers_response=$(curl -sS -w "\n__HTTP_STATUS__:%{http_code}" \
+            -H "Authorization: Bearer $token" \
+            "$API_BASE/servers" 2>&1) || true
+        http_status=$(echo "$servers_response" | grep '__HTTP_STATUS__:' | cut -d: -f2)
+        local servers_body
+        servers_body=$(echo "$servers_response" | grep -v '__HTTP_STATUS__:')
+        if [ "$http_status" != "200" ]; then
+            echo "[$(date -u +%FT%TZ)] register-session: /servers HTTP $http_status — $(echo "$servers_body" | head -c 200)" >&2
+            if [ "$http_status" = "401" ] || [ "$http_status" = "403" ]; then
+                echo "[$(date -u +%FT%TZ)] register-session: auth token expired — run 'pocketeng login' to refresh" >&2
+            fi
+            return 1
+        fi
+        server_id=$(echo "$servers_body" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    target_host = '$EC2_HOST'
+    for s in d.get('servers', []):
+        if s.get('publicIp') == target_host:
+            print(s.get('serverId', ''))
+            break
+except Exception as e:
+    sys.stderr.write(f'parse error: {e}\\n')
+" 2>&1)
+        if [ -z "$server_id" ]; then
+            echo "[$(date -u +%FT%TZ)] register-session: no server matching publicIp=$EC2_HOST in /servers response" >&2
+            return 1
+        fi
+        mkdir -p "$SERVERS_DIR" 2>/dev/null
+        echo "$server_id" > "$server_id_cache" 2>/dev/null
+    fi
+
+    # Build the JSON body. The session file path depends on the agent:
+    # Claude: ~/.claude/projects/<remote_hash>/<sid>.jsonl
+    # Cursor: ~/.cursor/projects/<remote_hash>/agent-transcripts/<sid>/<sid>.jsonl
+    # Codex:  ~/.codex/sessions/<rel_path> (date-based: YYYY/MM/DD/rollout-*.jsonl)
+    # Note: Cursor strips the leading dash from the hash (Claude keeps it).
+    local session_file agent_id
+    agent_id="${PE_AGENT:-claude}"
+    if [ "$agent_id" = "cursor" ]; then
+        local cursor_remote_hash="${remote_hash#-}"
+        session_file="/home/${EC2_USER}/.cursor/projects/${cursor_remote_hash}/agent-transcripts/${sid}/${sid}.jsonl"
+    elif [ "$agent_id" = "codex" ]; then
+        # For Codex, find the actual file on EC2 by session UUID
+        local codex_find_result
+        codex_find_result=$(ssh_cmd "find ~/.codex/sessions -name '*${sid}*.jsonl' -type f 2>/dev/null | head -1" 2>/dev/null)
+        if [ -n "$codex_find_result" ]; then
+            session_file="$codex_find_result"
+        else
+            session_file="/home/${EC2_USER}/.codex/sessions/${sid}.jsonl"
+        fi
+    else
+        session_file="/home/${EC2_USER}/.claude/projects/${remote_hash}/${sid}.jsonl"
+    fi
+    local body
+    body=$(python3 -c "
+import json
+print(json.dumps({
+    'action': 'register-synced-session',
+    'remoteSessionId': '$sid',
+    'sessionFilePath': '$session_file',
+    'worktreePath': '$remote_worktree',
+    'projectName': '$project_name',
+    'agent': '$agent_id',
+}))
+" 2>/dev/null)
+    if [ -z "$body" ]; then
+        echo "[$(date -u +%FT%TZ)] register-session: failed to build JSON body" >&2
+        return 1
+    fi
+
+    local resp http_status body_only
+    resp=$(curl -sS --max-time 10 -w "\n__HTTP_STATUS__:%{http_code}" -X POST \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "$API_BASE/servers/$server_id/chat" 2>&1) || true
+    http_status=$(echo "$resp" | grep '__HTTP_STATUS__:' | cut -d: -f2)
+    body_only=$(echo "$resp" | grep -v '__HTTP_STATUS__:')
+    if [ "$http_status" = "200" ]; then
+        echo "[$(date -u +%FT%TZ)] register-session: ${sid:0:8}... ok ($(echo "$body_only" | python3 -c '
+import sys,json
+try:
+    d=json.loads(sys.stdin.read())
+    print(f\"sessionId={d.get(\\\"sessionId\\\",\\\"?\\\")} status={d.get(\\\"status\\\",\\\"?\\\")} new={d.get(\\\"newMessages\\\",\\\"?\\\")}\")
+except Exception:
+    pass
+' 2>/dev/null))" >&2
+        return 0
+    fi
+    echo "[$(date -u +%FT%TZ)] register-session: HTTP $http_status — $(echo "$body_only" | head -c 200)" >&2
+    return 1
+}
+
+# Pull cloud state INTO the local project dir (cloud → laptop). Used at
+# `pocketeng sync` startup so coming back to the laptop after a phone
+# session picks up whatever work happened in the cloud.
+#
+# Merge policy: `rsync --update` — whichever side has the newer mtime wins,
+# per file. No `--delete` so files present only locally (in-progress work
+# that was never pushed) are never clobbered. On the .jsonl side this works
+# because claude sessions are append-only, so longer = newer mtime = the
+# one with phone turns appended.
+#
+# Returns 0 if the pull ran (remote dir exists and rsync succeeded), 1 if
+# skipped (first-time pairing — remote dir not yet created), 2 on error.
+_do_sync_pull() {
+    local PROJECT_DIR="$1"
+    local PROJECT_DIR_REAL
+    PROJECT_DIR_REAL=$(cd -- "$PROJECT_DIR" 2>/dev/null && pwd -P) || PROJECT_DIR_REAL="$PROJECT_DIR"
+    local PROJECT_NAME
+    PROJECT_NAME=$(basename "$PROJECT_DIR_REAL")
+    local REMOTE_PROJECT="$WORK_DIR/$PROJECT_NAME"
+
+    # Skip if the cloud has no state for this project yet (brand-new pairing)
+    local remote_exists
+    remote_exists=$(ssh_cmd "test -d $REMOTE_PROJECT && echo yes || echo no" 2>/dev/null)
+    [ "$remote_exists" != "yes" ] && return 1
+
+    # Pull project code. Mirror the same ignore set as the push so round
+    # trips are symmetric and --update mtime comparison is meaningful.
+    # NO --delete: never clobber local-only files (in-progress laptop work).
+    rsync -az --update \
+        --exclude=.git --exclude=node_modules --exclude=.build \
+        --exclude=DerivedData --exclude=.DS_Store --exclude=__pycache__ \
+        --exclude='*.pyc' --exclude=.venv --exclude=venv --exclude=.env \
+        --exclude=dist --exclude=.next --exclude=.claude --exclude=build \
+        --exclude=target --exclude=Pods --exclude='*.egg-info' \
+        --exclude='*.log' --exclude=.swiftpm --exclude=.aws-sam \
+        --max-size='50m' \
+        -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+        "$EC2_USER@$EC2_HOST:$REMOTE_PROJECT/" "$PROJECT_DIR_REAL/" 2>/dev/null || return 2
+
+    # Pull agent session .jsonl files. rsync with a trailing / and a glob
+    # won't work — use a dir-level sync instead, which transfers everything
+    # under the remote session dir. The local target is the escaped
+    # *physical* path (macOS /tmp → /private/tmp considered).
+    local RESOLVED_PATH REMOTE_HASH LOCAL_HASH
+    RESOLVED_PATH=$(ssh_cmd "cd $REMOTE_PROJECT && pwd" 2>/dev/null) || return 0
+    REMOTE_HASH=$(echo "$RESOLVED_PATH" | sed 's|/|-|g')
+    LOCAL_HASH=$(echo "$PROJECT_DIR_REAL" | sed 's|/|-|g')
+
+    local REMOTE_SESSION_DIR LOCAL_SESSION_DIR
+    REMOTE_SESSION_DIR=$(_agent_remote_session_dir "$REMOTE_HASH")
+    LOCAL_SESSION_DIR=$(_agent_session_dir "$LOCAL_HASH")
+
+    local remote_sessions_exist
+    remote_sessions_exist=$(ssh_cmd "test -d $REMOTE_SESSION_DIR && echo yes || echo no" 2>/dev/null)
+    if [ "$remote_sessions_exist" = "yes" ]; then
+        mkdir -p "$LOCAL_SESSION_DIR"
+        rsync -az --update \
+            --include='*.jsonl' --include='*.meta.json' --include='*/' --exclude='*' \
+            -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+            "$EC2_USER@$EC2_HOST:$REMOTE_SESSION_DIR/" \
+            "$LOCAL_SESSION_DIR/" 2>/dev/null
+    fi
+
+    # Cursor: also pull the chat store.db (and WAL/SHM sidecars) so laptop
+    # `agent --resume <sid>` can continue a session that was started from
+    # the phone or web UI. The cwd-hash for the chats dir is md5 of the
+    # ABSOLUTE path, which differs between laptop and EC2.
+    if [ "${PE_AGENT:-claude}" = "cursor" ]; then
+        local LOCAL_MD5 REMOTE_MD5 REMOTE_CHATS_DIR
+        LOCAL_MD5=$(printf '%s' "$PROJECT_DIR_REAL" | openssl md5 2>/dev/null | awk '{print $NF}')
+        REMOTE_MD5=$(printf '%s' "$RESOLVED_PATH"   | openssl md5 2>/dev/null | awk '{print $NF}')
+        REMOTE_CHATS_DIR="\$HOME/.cursor/chats/$REMOTE_MD5"
+        if [ -n "$LOCAL_MD5" ] && [ -n "$REMOTE_MD5" ]; then
+            local remote_chats_exist
+            remote_chats_exist=$(ssh_cmd "test -d $REMOTE_CHATS_DIR && echo yes || echo no" 2>/dev/null)
+            if [ "$remote_chats_exist" = "yes" ]; then
+                mkdir -p "$HOME/.cursor/chats/$LOCAL_MD5"
+                rsync -az --update \
+                    --include='store.db' --include='store.db-wal' --include='store.db-shm' \
+                    --include='*/' --exclude='*' \
+                    -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+                    "$EC2_USER@$EC2_HOST:.cursor/chats/$REMOTE_MD5/" \
+                    "$HOME/.cursor/chats/$LOCAL_MD5/" 2>/dev/null
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# ─── Sync: Pull cloud sessions + register new ones ────────────────────────
+#
+# Called by the daemon loop on a slow cadence. Snapshots local session files
+# before the pull so we can detect which .jsonl files are new (came from EC2).
+# New sessions get registered via the backend API so they appear in the UI.
+# Uses rsync --update (no --delete): never clobbers local-only files.
+
+_sync_pull_and_register() {
+    local local_dir="$1"
+    local local_dir_real="$2"
+
+    local LOCAL_HASH LOCAL_SESSION_DIR
+    LOCAL_HASH=$(echo "$local_dir_real" | sed 's|/|-|g')
+    LOCAL_SESSION_DIR=$(_agent_session_dir "$LOCAL_HASH")
+
+    # Snapshot existing .jsonl files before pull
+    local before_files=""
+    if [ -d "$LOCAL_SESSION_DIR" ]; then
+        before_files=$(find "$LOCAL_SESSION_DIR" -name '*.jsonl' -type f 2>/dev/null | sort)
+    fi
+
+    # Run the pull (safe: --update, no --delete)
+    local pull_rc
+    _do_sync_pull "$local_dir"
+    pull_rc=$?
+    if [ "$pull_rc" -eq 1 ]; then
+        return 0  # remote dir not created yet, nothing to pull
+    elif [ "$pull_rc" -eq 2 ]; then
+        echo "[$(date -u +%FT%TZ)] pull FAILED" >&2
+        return 1
+    fi
+
+    echo "[$(date -u +%FT%TZ)] pull ok"
+
+    # Detect new .jsonl files that appeared after pull
+    [ -d "$LOCAL_SESSION_DIR" ] || return 0
+    local after_files
+    after_files=$(find "$LOCAL_SESSION_DIR" -name '*.jsonl' -type f 2>/dev/null | sort)
+
+    local new_files
+    if [ -z "$before_files" ]; then
+        new_files="$after_files"
+    else
+        new_files=$(comm -23 <(echo "$after_files") <(echo "$before_files"))
+    fi
+
+    [ -z "$new_files" ] && return 0
+
+    # Register each new session file in the backend. We need the remote
+    # worktree path and hash — resolve them once.
+    local PROJECT_NAME REMOTE_PROJECT RESOLVED_PATH REMOTE_HASH
+    PROJECT_NAME=$(basename "$local_dir_real")
+    REMOTE_PROJECT="$WORK_DIR/$PROJECT_NAME"
+    RESOLVED_PATH=$(ssh_cmd "cd $REMOTE_PROJECT && pwd" 2>/dev/null) || return 0
+    REMOTE_HASH=$(echo "$RESOLVED_PATH" | sed 's|/|-|g')
+
+    echo "$new_files" | while IFS= read -r session_file; do
+        [ -z "$session_file" ] && continue
+        local sid
+        sid=$(_agent_session_id_from_file "$session_file")
+        [ -z "$sid" ] && continue
+
+        echo "[$(date -u +%FT%TZ)] registering pulled session ${sid:0:8}..."
+        ( _register_synced_session_api "$sid" "$RESOLVED_PATH" \
+            "$REMOTE_HASH" "$PROJECT_NAME" >&2 ) &
+    done
+
+    return 0
+}
+
+# ─── Sync: Continuous local ↔ cloud mirror ────────────────────────────────
+#
+# Runs a background poll-based watcher that rsyncs the current directory
+# and the local Claude session .jsonl to the paired cloud workspace every
+# few seconds. Agent runs LOCALLY; state mirrors to cloud so you can close
+# your laptop and pick up on phone/web without thinking about it.
+# Also pulls cloud sessions to local on a slower cadence (~30s).
+#
+# Storage:
+#   $CONFIG_DIR/pairs.json               map: local_dir -> { profile, ... }
+#   $CONFIG_DIR/watchers/<hash>.pid      watcher process id
+#   $CONFIG_DIR/watchers/<hash>.log      watcher stdout/stderr
+#   $CONFIG_DIR/watchers/<hash>.ts       timestamp file for find -newer
+#   $CONFIG_DIR/watchers/<hash>.sid      last-seen session id (for UI)
+
+_pair_hash() {
+    # Stable short hash of an absolute path, used as filename for pid/log/ts
+    # files. shasum is present on both macOS (stock) and Linux (coreutils).
+    echo -n "$1" | shasum -a 256 | cut -c1-12
+}
+
+_pairs_read() {
+    # Load pairs.json as JSON, output the full object. Empty {} if missing.
+    if [ -f "$PAIRS_FILE" ]; then
+        cat "$PAIRS_FILE"
+    else
+        echo '{"pairs":{}}'
+    fi
+}
+
+_pair_get() {
+    # Get the profile name paired with a local dir, or "" if unpaired.
+    local dir="$1"
+    _pairs_read | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+p = d.get('pairs', {}).get('$dir')
+print(p.get('profile', '') if p else '')
+" 2>/dev/null
+}
+
+_pair_set() {
+    # Add or update a pair: localDir -> { profile, createdAt }
+    local dir="$1"
+    local profile="$2"
+    mkdir -p "$CONFIG_DIR"
+    local current
+    current=$(_pairs_read)
+    echo "$current" | python3 -c "
+import sys, json, datetime
+d = json.load(sys.stdin)
+d.setdefault('pairs', {})
+d['pairs']['$dir'] = {
+    'profile': '$profile',
+    'createdAt': datetime.datetime.utcnow().isoformat() + 'Z',
+}
+json.dump(d, sys.stdout, indent=2)
+" > "$PAIRS_FILE.tmp" 2>/dev/null && mv "$PAIRS_FILE.tmp" "$PAIRS_FILE"
+    chmod 600 "$PAIRS_FILE" 2>/dev/null
+}
+
+_pair_remove() {
+    local dir="$1"
+    [ ! -f "$PAIRS_FILE" ] && return 0
+    _pairs_read | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+d.get('pairs', {}).pop('$dir', None)
+json.dump(d, sys.stdout, indent=2)
+" > "$PAIRS_FILE.tmp" 2>/dev/null && mv "$PAIRS_FILE.tmp" "$PAIRS_FILE"
+}
+
+_pairs_list() {
+    _pairs_read | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for local_dir, info in d.get('pairs', {}).items():
+    print(f\"{local_dir}\t{info.get('profile', '')}\t{info.get('createdAt', '')}\")
+" 2>/dev/null
+}
+
+_watcher_alive() {
+    # Is a watcher currently running for this dir?
+    local hash="$1"
+    local pid_file="$WATCHERS_DIR/${hash}.pid"
+    [ ! -f "$pid_file" ] && return 1
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+    [ -z "$pid" ] && return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+# Core daemon loop. Re-invoked as a background subprocess via `$0 _sync-daemon`.
+# Arguments: <local_dir> <profile>
+# This MUST be fast-return-safe: if anything goes wrong, log it and keep looping
+# rather than die silently.
+_sync_daemon_loop() {
+    local local_dir="$1"
+    local profile="$2"
+    # Resolve the physical path for the claude session dir lookup (macOS
+    # /tmp → /private/tmp). Pairs are keyed on the caller-supplied path so
+    # `_pair_hash` uses $local_dir as-is for the pid/log/ts filenames.
+    local local_dir_real
+    local_dir_real=$(cd -- "$local_dir" 2>/dev/null && pwd -P) || local_dir_real="$local_dir"
+
+    local hash
+    hash=$(_pair_hash "$local_dir")
+    local pid_file="$WATCHERS_DIR/${hash}.pid"
+    local log_file="$WATCHERS_DIR/${hash}.log"
+    local ts_file="$WATCHERS_DIR/${hash}.ts"
+
+    mkdir -p "$WATCHERS_DIR"
+    echo $$ > "$pid_file"
+    touch "$ts_file"
+
+    # Load the workspace profile so EC2_HOST, SSH_KEY etc are set
+    SERVER_OVERRIDE="$profile"
+    load_config "$profile"
+
+    echo "[$(date -u +%FT%TZ)] sync daemon started (pid $$, profile=$profile, dir=$local_dir real=$local_dir_real)" >> "$log_file"
+
+    local local_session_dir
+    local_session_dir=$(_agent_session_dir "$(echo "$local_dir_real" | sed 's|/|-|g')")
+
+    # Run an initial sync immediately so the cloud has current state
+    if _do_sync_once "$local_dir" >> "$log_file" 2>&1; then
+        echo "[$(date -u +%FT%TZ)] initial sync ok" >> "$log_file"
+    else
+        echo "[$(date -u +%FT%TZ)] initial sync FAILED" >> "$log_file"
+    fi
+    touch "$ts_file"
+
+    local consecutive_failures=0
+    local pull_counter=0
+    local PULL_EVERY=10  # pull every ~30s (10 iterations × 3s sleep)
+
+    while true; do
+        sleep 3
+        pull_counter=$((pull_counter + 1))
+
+        # Cheap change detection: any file newer than our timestamp?
+        local has_changes=""
+        has_changes=$(find "$local_dir_real" -type f -newer "$ts_file" \
+            ! -path '*/node_modules/*' ! -path '*/.git/*' ! -path '*/.next/*' \
+            ! -path '*/dist/*' ! -path '*/build/*' ! -path '*/target/*' \
+            ! -path '*/.venv/*' ! -path '*/venv/*' ! -path '*/__pycache__/*' \
+            ! -path '*/.aws-sam/*' ! -path '*/.swiftpm/*' \
+            ! -name '*.pyc' ! -name '*.log' \
+            -print -quit 2>/dev/null)
+
+        if [ -z "$has_changes" ] && [ -d "$local_session_dir" ]; then
+            has_changes=$(find "$local_session_dir" -type f -newer "$ts_file" \
+                -print -quit 2>/dev/null)
+        fi
+
+        # Push: only when local changes detected
+        if [ -n "$has_changes" ]; then
+            sleep 2  # debounce
+            touch "$ts_file"
+
+            if _do_sync_once "$local_dir" >> "$log_file" 2>&1; then
+                echo "[$(date -u +%FT%TZ)] synced" >> "$log_file"
+                consecutive_failures=0
+            else
+                consecutive_failures=$((consecutive_failures + 1))
+                echo "[$(date -u +%FT%TZ)] sync FAILED (${consecutive_failures})" >> "$log_file"
+                if [ "$consecutive_failures" -ge 3 ]; then
+                    sleep 20
+                fi
+            fi
+        fi
+
+        # Pull: cloud → local on slower cadence
+        if [ "$pull_counter" -ge "$PULL_EVERY" ]; then
+            pull_counter=0
+            _sync_pull_and_register "$local_dir" "$local_dir_real" >> "$log_file" 2>&1
+        fi
+    done
+}
+
+cmd_sync() {
+    shift 2>/dev/null || true
+    local subcommand="${1:-start}"
+    local sync_target=""
+
+    # Parse --to <workspace> from any position
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --to)
+                shift
+                sync_target="${1:-}"
+                if [ -z "$sync_target" ]; then
+                    echo -e "  ${RED}--to requires a workspace name.${NC} See ${BOLD}pocketeng servers${NC}"
+                    exit 1
+                fi
+                ;;
+            *)  args+=("$1") ;;
+        esac
+        shift
+    done
+    subcommand="${args[0]:-start}"
+
+    case "$subcommand" in
+        ""|start)  _sync_start "$sync_target" ;;
+        stop)      _sync_stop ;;
+        status)    _sync_status ;;
+        pull)      _sync_pull_cmd ;;
+        unpair)    _sync_unpair ;;
+        *)
+            echo "Usage: pocketeng sync [start|stop|status|pull|unpair] [--to <workspace>]"
+            exit 1
+            ;;
+    esac
+}
+
+# One-shot pull: grab the latest cloud state for the current dir without
+# touching the daemon. Useful when you want to grab phone changes quickly
+# without starting a full sync session.
+_sync_pull_cmd() {
+    local PROJECT_DIR
+    PROJECT_DIR="$(pwd)"
+    local PROJECT_NAME
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
+
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Pull cloud state for ${BOLD}$PROJECT_NAME${NC}"
+    echo ""
+
+    # Load the paired profile if one exists; otherwise fall back to active
+    local profile
+    profile=$(_pair_get "$PROJECT_DIR")
+    if [ -z "$profile" ]; then
+        profile=$(active_profile)
+        if [ -z "$profile" ] || [ ! -f "$SERVERS_DIR/${profile}.conf" ]; then
+            echo -e "  ${RED}No workspace configured.${NC} Run ${BOLD}pocketeng login${NC} first."
+            return 1
+        fi
+        echo -e "  ${DIM}Not paired — using active workspace: $profile${NC}"
+    fi
+
+    SERVER_OVERRIDE="$profile"
+    load_config "$profile"
+    require_config
+
+    echo -e "  Source:  ${DIM}$EC2_USER@$EC2_HOST:$WORK_DIR/$PROJECT_NAME${NC}"
+    echo -e "  Target:  ${DIM}$PROJECT_DIR${NC}"
+    echo ""
+
+    echo -n "  Pulling... "
+    _do_sync_pull "$PROJECT_DIR"
+    case $? in
+        0) echo -e "${GREEN}done${NC}" ;;
+        1)
+            # Not an error — just a no-op because the cloud has no state
+            # for this project yet. Scripts shouldn't treat this as failure.
+            echo -e "${YELLOW}nothing to pull${NC}"
+            echo -e "  ${DIM}No cloud state for this project yet.${NC}"
+            return 0
+            ;;
+        *)
+            echo -e "${RED}failed${NC}"
+            echo -e "  ${DIM}Check your SSH connection: ssh -i $SSH_KEY $EC2_USER@$EC2_HOST${NC}"
+            return 1
+            ;;
+    esac
+
+    # If a watcher is running for this dir, bump its timestamp file forward
+    # so the very next poll doesn't re-push everything we just pulled.
+    local hash
+    hash=$(_pair_hash "$PROJECT_DIR")
+    if _watcher_alive "$hash"; then
+        touch "$WATCHERS_DIR/${hash}.ts" 2>/dev/null
+        echo -e "  ${DIM}Nudged running watcher so the pulled files don't bounce back.${NC}"
+    fi
+
+    echo ""
+    echo -e "  ${GREEN}${BOLD}Pull complete.${NC}"
+}
+
+_sync_mcp_servers() {
+    local LOCAL_SETTINGS="$HOME/.claude/settings.json"
+    [ -f "$LOCAL_SETTINGS" ] || return 0
+
+    # Resolve the remote home directory (~ doesn't expand in child_process.spawn)
+    local REMOTE_HOME
+    REMOTE_HOME=$(ssh_cmd "echo \$HOME" 2>/dev/null) || return 0
+
+    # Single Python script reads local settings, rewrites MCP configs for
+    # the remote, and outputs JSON. Uses heredoc (no shell interpolation)
+    # so special chars in JSON are safe. REMOTE_HOME is passed via env.
+    local result
+    result=$(REMOTE_HOME="$REMOTE_HOME" python3 << 'PYEOF'
+import json, sys, os
+
+path = os.path.expanduser("~/.claude/settings.json")
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+mcp = data.get("mcpServers", {})
+if not mcp:
+    sys.exit(1)
+
+remote_home = os.environ.get("REMOTE_HOME", "/home/ec2-user")
+remote = {}
+installs = []
+skipped = []
+
+for name, cfg in mcp.items():
+    cmd = cfg.get("command", "")
+    args = cfg.get("args", [])
+    env = cfg.get("env", {})
+
+    # npx/bunx/uvx — portable, works as-is on remote
+    if cmd in ("npx", "bunx", "uvx"):
+        remote[name] = cfg
+        continue
+
+    # node + absolute local path — find the npm package, rewrite to npx
+    if cmd == "node" and args and os.path.isabs(args[0]):
+        local_path = args[0]
+        pkg_name = None
+        pkg_root = None
+        d = os.path.dirname(local_path)
+        for _ in range(10):
+            pj = os.path.join(d, "package.json")
+            if os.path.isfile(pj):
+                try:
+                    with open(pj) as f:
+                        pkg_name = json.load(f).get("name")
+                    pkg_root = d
+                except Exception:
+                    pass
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+
+        if pkg_name and pkg_root:
+            rel = os.path.relpath(local_path, pkg_root)
+            # Rsync source to remote ~/.claude/mcp/<name>/, use absolute path
+            mcp_dir = f"{remote_home}/.claude/mcp/{name}"
+            remote_entry = os.path.join(mcp_dir, rel)
+            remote[name] = {
+                "command": "node",
+                "args": [remote_entry],
+                "env": env,
+                "_sync_src": pkg_root,  # used by bash to rsync
+                "_sync_dest": mcp_dir,
+            }
+        else:
+            skipped.append(name)
+        continue
+
+    # python/python3 with absolute local path — can't resolve on remote
+    if cmd in ("python3", "python") and args and os.path.isabs(args[0]):
+        skipped.append(name)
+        continue
+
+    # Relative paths, simple commands — pass through
+    remote[name] = cfg
+
+print(json.dumps({
+    "servers": remote,
+    "installs": installs,
+    "total": len(mcp),
+    "skipped": skipped,
+}))
+PYEOF
+    ) || return 0
+
+    local total synced_count
+    total=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin)['total'])")
+    synced_count=$(echo "$result" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['servers']))")
+    [ "$synced_count" -gt 0 ] 2>/dev/null || return 0
+
+    echo -n "  Syncing MCP servers ($synced_count/$total)... "
+
+    # Rsync local MCP server source directories to remote ~/.claude/mcp/<name>/
+    local sync_pairs
+    sync_pairs=$(echo "$result" | python3 -c "
+import json, sys
+servers = json.load(sys.stdin)['servers']
+for name, cfg in servers.items():
+    src = cfg.get('_sync_src', '')
+    dest = cfg.get('_sync_dest', '')
+    if src and dest:
+        print(f'{src}\t{dest}')
+" 2>/dev/null)
+
+    if [ -n "$sync_pairs" ]; then
+        ssh_cmd "mkdir -p ~/.claude/mcp" 2>/dev/null
+        while IFS=$'\t' read -r src dest; do
+            [ -d "$src" ] || continue
+            rsync -az -q --delete \
+                --exclude=node_modules --exclude=.git --exclude=dist \
+                -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+                "$src/" "$EC2_USER@$EC2_HOST:$dest/" 2>/dev/null || true
+            # Install dependencies on remote if package.json exists
+            ssh_cmd "cd $dest && [ -f package.json ] && npm install --production 2>/dev/null" 2>/dev/null || true
+        done <<< "$sync_pairs"
+    fi
+
+    # Read existing remote settings, merge in the new mcpServers block,
+    # and write back. Pipe both JSONs through stdin to avoid quoting issues.
+    local remote_settings
+    remote_settings=$(ssh_cmd "cat ~/.claude/settings.json 2>/dev/null || echo '{}'" 2>/dev/null)
+
+    local merged
+    merged=$( {
+        echo "$remote_settings"
+        echo "---MCP_SEP---"
+        echo "$result"
+    } | python3 -c "
+import json, sys
+
+blob = sys.stdin.read()
+parts = blob.split('---MCP_SEP---', 1)
+try:
+    existing = json.loads(parts[0].strip())
+except Exception:
+    existing = {}
+try:
+    new_servers = json.loads(parts[1].strip())['servers']
+except Exception:
+    new_servers = {}
+
+# Strip internal _sync_* keys before writing
+for cfg in new_servers.values():
+    for k in list(cfg.keys()):
+        if k.startswith('_sync_'):
+            del cfg[k]
+
+existing['mcpServers'] = new_servers
+print(json.dumps(existing, indent=2))
+" 2>/dev/null)
+
+    if [ -n "$merged" ]; then
+        # Write via base64 to avoid heredoc/quoting issues with JSON content
+        local encoded
+        encoded=$(printf '%s' "$merged" | base64)
+        ssh_cmd "mkdir -p ~/.claude && echo '$encoded' | base64 -d > ~/.claude/settings.json" 2>/dev/null
+        echo -e "${GREEN}done${NC}"
+    else
+        echo -e "${DIM}skipped${NC}"
+    fi
+}
+
+_sync_pick_workspace() {
+    # Interactive workspace picker. Prints the chosen profile name to stdout.
+    local conf_files=("$SERVERS_DIR"/*.conf)
+    if [ ${#conf_files[@]} -eq 0 ] || [ ! -f "${conf_files[0]}" ]; then
+        return 1
+    fi
+
+    # Single workspace — auto-select
+    if [ ${#conf_files[@]} -eq 1 ]; then
+        basename "${conf_files[0]}" .conf
+        return 0
+    fi
+
+    echo -e "  Pick a workspace to sync to:" >&2
+    echo "" >&2
+
+    local i=1
+    local names=() hosts=() agents=()
+    for f in "${conf_files[@]}"; do
+        local n h a
+        n=$(basename "$f" .conf)
+        h=$(grep '^PE_HOST=' "$f" | head -1 | cut -d'"' -f2)
+        a=$(grep '^PE_AGENT=' "$f" | head -1 | cut -d'"' -f2)
+        a="${a:-claude}"
+        names+=("$n")
+        hosts+=("${h:-?}")
+        agents+=("$a")
+        printf "    ${BOLD}%d)${NC}  %-20s %-16s ${DIM}[%s]${NC}\n" "$i" "$n" "${h:-?}" "$a" >&2
+        i=$((i + 1))
+    done
+    echo "" >&2
+    echo -ne "  Enter number [1-${#names[@]}]: " >&2
+    local choice
+    read -r choice
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#names[@]} ]; then
+        echo -e "  ${RED}Invalid selection.${NC}" >&2
+        return 1
+    fi
+    echo "${names[$((choice - 1))]}"
+}
+
+_sync_start() {
+    local target_override="$1"
+    local PROJECT_DIR
+    PROJECT_DIR="$(pwd)"
+    local PROJECT_NAME
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
+    local hash
+    hash=$(_pair_hash "$PROJECT_DIR")
+
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Sync ${BOLD}$PROJECT_NAME${NC}"
+    echo ""
+
+    # --to flag forces a re-pair even if already paired
+    if [ -n "$target_override" ]; then
+        if [ ! -f "$SERVERS_DIR/${target_override}.conf" ]; then
+            echo -e "  ${RED}Workspace '$target_override' not found.${NC} See ${BOLD}pocketeng servers${NC}"
+            return 1
+        fi
+        # Stop existing watcher if running
+        if _watcher_alive "$hash"; then
+            local old_pid
+            old_pid=$(cat "$WATCHERS_DIR/${hash}.pid" 2>/dev/null)
+            kill "$old_pid" 2>/dev/null; sleep 0.3; kill -9 "$old_pid" 2>/dev/null
+            rm -f "$WATCHERS_DIR/${hash}.pid" "$WATCHERS_DIR/${hash}.ts" 2>/dev/null
+        fi
+        echo -e "  Targeting workspace: ${BOLD}$target_override${NC}"
+        _pair_set "$PROJECT_DIR" "$target_override"
+    fi
+
+    # Already running?
+    if _watcher_alive "$hash"; then
+        local existing_pid existing_profile existing_agent
+        existing_pid=$(cat "$WATCHERS_DIR/${hash}.pid")
+        existing_profile=$(_pair_get "$PROJECT_DIR")
+        existing_agent=$(grep '^PE_AGENT=' "$SERVERS_DIR/${existing_profile}.conf" 2>/dev/null | head -1 | cut -d'"' -f2)
+        existing_agent="${existing_agent:-claude}"
+        echo -e "  ${GREEN}Already syncing${NC} to ${BOLD}$existing_profile${NC} ${DIM}[$existing_agent]${NC} ${DIM}(pid $existing_pid)${NC}"
+        echo -e "  Log:    ${DIM}$WATCHERS_DIR/${hash}.log${NC}"
+        echo -e "  Stop:   ${BOLD}pocketeng sync stop${NC}"
+        echo -e "  Retarget: ${BOLD}pocketeng sync --to <workspace>${NC}"
+        return 0
+    fi
+
+    # Pair with a workspace if not already
+    local profile
+    profile=$(_pair_get "$PROJECT_DIR")
+    if [ -z "$profile" ]; then
+        if [ ! -d "$SERVERS_DIR" ] || [ -z "$(ls "$SERVERS_DIR"/*.conf 2>/dev/null)" ]; then
+            echo -e "  ${RED}No workspaces configured.${NC} Run ${BOLD}pocketeng login${NC} first."
+            return 1
+        fi
+        profile=$(_sync_pick_workspace)
+        if [ -z "$profile" ]; then
+            echo -e "  ${RED}No workspace selected.${NC}"
+            return 1
+        fi
+        echo ""
+        echo -e "  Pairing with workspace: ${BOLD}$profile${NC}"
+        _pair_set "$PROJECT_DIR" "$profile"
+    fi
+
+    # Load config for the chosen profile and sanity-check the connection
+    SERVER_OVERRIDE="$profile"
+    load_config "$profile"
+    require_config
+
+    local _sync_agent
+    _sync_agent=$(grep '^PE_AGENT=' "$SERVERS_DIR/${profile}.conf" 2>/dev/null | head -1 | cut -d'"' -f2)
+    _sync_agent="${_sync_agent:-claude}"
+
+    echo -e "  Workspace: ${BOLD}$profile${NC} ${DIM}[$_sync_agent]${NC}"
+    echo -e "  Local:     ${DIM}$PROJECT_DIR${NC}"
+    echo -e "  Remote:    ${DIM}$EC2_USER@$EC2_HOST:$WORK_DIR/$PROJECT_NAME${NC}"
+    echo ""
+
+    # First try to pull newer-mtime files from the cloud. Covers the
+    # "coming back to laptop after phone work" case. Skipped silently on
+    # first-time pairing (nothing to pull yet).
+    echo -n "  Pulling from cloud... "
+    _do_sync_pull "$PROJECT_DIR"
+    case $? in
+        0) echo -e "${GREEN}done${NC}" ;;
+        1) echo -e "${DIM}skipped (first sync)${NC}" ;;
+        *) echo -e "${YELLOW}pull had errors, continuing${NC}" ;;
+    esac
+
+    # Do an initial foreground push — code only, skip old session files.
+    # The daemon handles session sync going forward (only new activity).
+    echo -n "  Pushing code... "
+    if ! _do_sync_once "$PROJECT_DIR" "skip-sessions"; then
+        echo -e "${RED}failed${NC}"
+        echo ""
+        echo -e "  Check ${BOLD}ssh -i $SSH_KEY $EC2_USER@$EC2_HOST${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}done${NC}"
+
+    # Sync MCP servers from local ~/.claude/settings.json to remote
+    _sync_mcp_servers
+
+    # Spawn the background daemon. Use an absolute path to this script so
+    # the child can re-exec itself regardless of cwd or how the user invoked
+    # pocketeng (from PATH, ./pocketeng, or a symlink). nohup + disown +
+    # </dev/null detaches it from this terminal so the user can close the tab.
+    mkdir -p "$WATCHERS_DIR"
+    : > "$WATCHERS_DIR/${hash}.log"
+
+    local self_path
+    if command -v realpath >/dev/null 2>&1; then
+        self_path=$(realpath "$0" 2>/dev/null)
+    fi
+    if [ -z "$self_path" ] || [ ! -f "$self_path" ]; then
+        self_path="$(cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")"
+    fi
+
+    # shellcheck disable=SC2086
+    nohup "$self_path" --server "$profile" _sync-daemon "$PROJECT_DIR" "$profile" \
+        </dev/null >>"$WATCHERS_DIR/${hash}.log" 2>&1 &
+    local daemon_pid=$!
+    disown "$daemon_pid" 2>/dev/null || true
+
+    # Give the daemon a moment to write its pid file and settle
+    sleep 0.5
+
+    if _watcher_alive "$hash"; then
+        echo ""
+        echo -e "  ${GREEN}${BOLD}Background sync started${NC} ${DIM}(pid $daemon_pid)${NC}"
+        echo ""
+        echo -e "  Syncing to ${BOLD}$profile${NC} ${DIM}[$_sync_agent]${NC}"
+        echo -e "  Close your laptop anytime — continue on phone or web."
+        echo ""
+        echo -e "  ${DIM}Stop:      pocketeng sync stop${NC}"
+        echo -e "  ${DIM}Status:    pocketeng sync status${NC}"
+        echo -e "  ${DIM}Retarget:  pocketeng sync --to <workspace>${NC}"
+        echo -e "  ${DIM}Log:       $WATCHERS_DIR/${hash}.log${NC}"
+    else
+        echo -e "  ${RED}Daemon failed to start.${NC} See ${DIM}$WATCHERS_DIR/${hash}.log${NC}"
+        return 1
+    fi
+}
+
+_sync_stop() {
+    local PROJECT_DIR
+    PROJECT_DIR="$(pwd)"
+    local hash
+    hash=$(_pair_hash "$PROJECT_DIR")
+    local pid_file="$WATCHERS_DIR/${hash}.pid"
+
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Stop sync"
+    echo ""
+
+    if [ ! -f "$pid_file" ]; then
+        echo -e "  ${DIM}No sync running for $(basename "$PROJECT_DIR").${NC}"
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        sleep 0.3
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null
+        fi
+        echo -e "  ${GREEN}Stopped${NC} ${DIM}(pid $pid)${NC}"
+    else
+        echo -e "  ${DIM}Watcher was not running.${NC}"
+    fi
+
+    rm -f "$pid_file" "$WATCHERS_DIR/${hash}.ts" 2>/dev/null
+}
+
+_sync_status() {
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Sync status"
+    echo ""
+
+    if [ ! -f "$PAIRS_FILE" ] || [ -z "$(_pairs_list)" ]; then
+        echo -e "  ${DIM}No paired directories.${NC}"
+        echo ""
+        echo -e "  Start one: ${BOLD}cd <project> && pocketeng sync${NC}"
+        return 0
+    fi
+
+    local any_running=0
+    while IFS=$'\t' read -r local_dir profile created; do
+        [ -z "$local_dir" ] && continue
+        local hash
+        hash=$(_pair_hash "$local_dir")
+        local name
+        name=$(basename "$local_dir")
+        local pid_file="$WATCHERS_DIR/${hash}.pid"
+        local log_file="$WATCHERS_DIR/${hash}.log"
+
+        local state pid_display last_sync
+        pid_display=""
+        last_sync=""
+
+        if _watcher_alive "$hash"; then
+            state="${GREEN}● running${NC}"
+            pid_display=" ${DIM}(pid $(cat "$pid_file" 2>/dev/null))${NC}"
+            any_running=1
+        elif [ -f "$pid_file" ]; then
+            state="${YELLOW}○ stale${NC}"
+        else
+            state="${DIM}○ stopped${NC}"
+        fi
+
+        if [ -f "$log_file" ]; then
+            last_sync=$(grep ' synced$' "$log_file" 2>/dev/null | tail -1 | cut -c2-20)
+        fi
+
+        local _pair_agent
+        _pair_agent=$(grep '^PE_AGENT=' "$SERVERS_DIR/${profile}.conf" 2>/dev/null | head -1 | cut -d'"' -f2)
+        _pair_agent="${_pair_agent:-claude}"
+
+        echo -e "  $state  ${BOLD}$name${NC}$pid_display"
+        echo -e "    ${DIM}$local_dir${NC}"
+        echo -e "    ${DIM}→ $profile [$_pair_agent]${NC}"
+        [ -n "$last_sync" ] && echo -e "    ${DIM}last sync: $last_sync${NC}"
+        echo ""
+    done < <(_pairs_list)
+
+    if [ "$any_running" = "0" ]; then
+        echo -e "  ${DIM}No active watchers. Start one with ${NC}${BOLD}pocketeng sync${NC}"
+        echo ""
+    fi
+}
+
+_sync_unpair() {
+    local PROJECT_DIR
+    PROJECT_DIR="$(pwd)"
+    local hash
+    hash=$(_pair_hash "$PROJECT_DIR")
+
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Unpair $(basename "$PROJECT_DIR")"
+    echo ""
+
+    # Stop any running watcher first
+    if _watcher_alive "$hash"; then
+        local pid
+        pid=$(cat "$WATCHERS_DIR/${hash}.pid" 2>/dev/null)
+        kill "$pid" 2>/dev/null
+        sleep 0.3
+        kill -9 "$pid" 2>/dev/null
+        echo -e "  ${DIM}Stopped watcher${NC}"
+    fi
+
+    rm -f "$WATCHERS_DIR/${hash}.pid" \
+          "$WATCHERS_DIR/${hash}.ts" \
+          "$WATCHERS_DIR/${hash}.log" \
+          "$WATCHERS_DIR/${hash}.sid" 2>/dev/null
+
+    _pair_remove "$PROJECT_DIR"
+    echo -e "  ${GREEN}Unpaired.${NC}"
+}
+
+# ─── Handoff: Transfer local session to EC2 ───────────────────────────────
+
+cmd_handoff() {
+    require_config
+    local PROJECT_DIR="${2:-.}"
+    PROJECT_DIR="$(cd -- "$PROJECT_DIR" && pwd)"
+    local PROJECT_NAME AGENT_NAME
+    PROJECT_NAME=$(basename "$PROJECT_DIR")
+    AGENT_NAME=$(_agent_display_name)
+
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} — Hand off to EC2"
+    echo ""
+
+    # 1. Find the most recent local session for the active agent
+    local LOCAL_HASH SESSION_DIR SESSION_FILE SESSION_ID
+    LOCAL_HASH=$(echo "$PROJECT_DIR" | sed 's|/|-|g')
+    SESSION_DIR=$(_agent_session_dir "$LOCAL_HASH")
+
+    SESSION_FILE=$(_agent_find_latest_session "$SESSION_DIR" "$PROJECT_DIR")
+
+    # Fallback: search broadly in the agent's session base
+    if [ -z "$SESSION_FILE" ]; then
+        local session_base
+        session_base=$(_agent_session_base)
+        SESSION_FILE=$(find "$session_base/projects" -name "*.jsonl" ! -name "agent-*" -newer "$session_base" 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$SESSION_FILE" ]; then
+        echo -e "  ${RED}No $AGENT_NAME session found.${NC}"
+        echo "  Start a $AGENT_NAME session first, then run handoff."
+        return 1
+    fi
+
+    SESSION_ID=$(_agent_session_id_from_file "$SESSION_FILE")
+    local SIZE
+    SIZE=$(du -h "$SESSION_FILE" | cut -f1 | tr -d '[:space:]')
+    echo -e "  Agent:   ${BOLD}$AGENT_NAME${NC}"
+    echo -e "  Session: ${DIM}${SESSION_ID:0:8}...${NC} ($SIZE)"
+    echo -e "  Project: ${BOLD}$PROJECT_NAME${NC}"
+    echo -e "  Target:  ${DIM}$EC2_HOST${NC}"
+    echo ""
+
+    # 2. Sync project code
+    echo -n "  Syncing code... "
+    local REMOTE_PROJECT="$WORK_DIR/$PROJECT_NAME"
+    ssh_cmd "mkdir -p $REMOTE_PROJECT" 2>/dev/null
+
+    rsync -azq --delete \
+        --exclude=.git --exclude=node_modules --exclude=.build \
+        --exclude=DerivedData --exclude=.DS_Store --exclude=__pycache__ \
+        --exclude='*.pyc' --exclude=.venv --exclude=venv --exclude=.env \
+        --exclude=dist --exclude=.next --exclude=.claude --exclude=build \
+        --exclude=target --exclude=Pods --exclude='*.egg-info' \
+        --max-size='50m' \
+        -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+        "$PROJECT_DIR/" "$EC2_USER@$EC2_HOST:$REMOTE_PROJECT/" 2>/dev/null
+    echo -e "${GREEN}done${NC}"
+
+    # 3. Transfer session file
+    echo -n "  Transferring session... "
+    local RESOLVED_PATH REMOTE_HASH REMOTE_SESSION_DIR
+    RESOLVED_PATH=$(ssh_cmd "cd $REMOTE_PROJECT && pwd" 2>/dev/null)
+    REMOTE_HASH=$(echo "$RESOLVED_PATH" | sed 's|/|-|g')
+    REMOTE_SESSION_DIR=$(_agent_remote_session_dir "$REMOTE_HASH")
+
+    if [ "${PE_AGENT:-claude}" = "cursor" ]; then
+        ssh_cmd "mkdir -p ~/$REMOTE_SESSION_DIR/$SESSION_ID" 2>/dev/null
+        scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SESSION_FILE" \
+            "$EC2_USER@$EC2_HOST:$REMOTE_SESSION_DIR/$SESSION_ID/$SESSION_ID.jsonl" 2>/dev/null
+    else
+        ssh_cmd "mkdir -p ~/$REMOTE_SESSION_DIR" 2>/dev/null
+        scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SESSION_FILE" \
+            "$EC2_USER@$EC2_HOST:$REMOTE_SESSION_DIR/$SESSION_ID.jsonl" 2>/dev/null
+    fi
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}failed${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}done${NC}"
+
+    # 4. Verify
+    echo -n "  Verifying... "
+    local VERIFY VERIFY_FILE
+    if [ "${PE_AGENT:-claude}" = "cursor" ]; then
+        VERIFY_FILE="$REMOTE_SESSION_DIR/$SESSION_ID/$SESSION_ID.jsonl"
+    else
+        VERIFY_FILE="$REMOTE_SESSION_DIR/$SESSION_ID.jsonl"
+    fi
+    VERIFY=$(ssh_cmd "test -f ~/$VERIFY_FILE && echo OK" 2>/dev/null)
+    if [ "$VERIFY" = "OK" ]; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${YELLOW}could not verify${NC}"
+    fi
+
+    echo ""
+    echo -e "  ${GREEN}${BOLD}Handoff complete!${NC}"
+    echo -e "  Open the web dashboard or phone app to continue this session."
+    echo ""
+}
+
+# ─── Help ────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    echo -e "${PURPLE}${BOLD}Pocket Eng${NC} v$VERSION — AI coding agents on your cloud, from anywhere."
+    echo ""
+    echo "Getting started:"
+    echo "  pocketeng login                 Sign in and sync workspaces"
+    echo "  pocketeng setup                 Connect a server manually (--host, --key)"
+    echo ""
+    echo "Local coding with cloud continuity (recommended):"
+    echo "  pocketeng sync                  Pick a workspace and start syncing current dir"
+    echo "  pocketeng sync --to <workspace> Sync to a specific workspace"
+    echo "  pocketeng sync pull             Pull cloud state without starting a watcher"
+    echo "  pocketeng sync stop             Stop the background watcher for this dir"
+    echo "  pocketeng sync status           Show all paired directories + watcher state"
+    echo "  pocketeng sync unpair           Remove current dir from pair list"
+    echo ""
+    echo "Remote session (agent runs on EC2 via tmux):"
+    echo "  pocketeng                       Start interactive session (SSH + tmux)"
+    echo "  pocketeng attach                Reattach to running session"
+    echo "  pocketeng handoff               One-shot transfer of local session + code"
+    echo ""
+    echo "Workspaces:"
+    echo "  pocketeng servers               List workspaces"
+    echo "  pocketeng switch <name>         Switch active workspace"
+    echo ""
+    echo "How sync works:"
+    echo "  1. cd into your project"
+    echo "  2. pocketeng sync     ← pulls cloud state first, then starts a background daemon"
+    echo "  3. Run claude / opencode / cursor normally. Edits mirror to cloud in ~3s."
+    echo "  4. Close laptop. Open phone app. Tap the session. Continue."
+    echo "  5. Back at laptop: pocketeng sync (or sync pull) grabs cloud changes first,"
+    echo "     then keeps mirroring. Newer-mtime wins per file; no local-only files are"
+    echo "     ever clobbered."
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+# Parse global flags
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --server) SERVER_OVERRIDE="$2"; shift 2 ;;
+        --server=*) SERVER_OVERRIDE="${1#*=}"; shift ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${ARGS[@]}"
+
+load_config
+
+case "${1:-}" in
+    login)              cmd_login ;;
+    setup)              cmd_setup "$@" ;;
+    handoff)            cmd_handoff "$@" ;;
+    sync)               cmd_sync "$@" ;;
+    servers|--servers)  cmd_servers ;;
+    switch)             cmd_switch "${2:-}" ;;
+    attach|--attach|-a) cmd_attach ;;
+    help|--help|-h)     cmd_help ;;
+    version|--version|-v) echo "pocketeng v$VERSION" ;;
+    # Internal verb: invoked by `pocketeng sync` via nohup. Not documented
+    # in help. Runs the background daemon loop; arguments: <local_dir> <profile>.
+    _sync-daemon)       _sync_daemon_loop "${2:-}" "${3:-}" ;;
+    "")                 [ -z "$EC2_HOST" ] && cmd_login || cmd_interactive ;;
+    -*)                 echo "Unknown option: $1"; cmd_help; exit 1 ;;
+    *)                  echo "Unknown command: $1"; cmd_help; exit 1 ;;
+esac

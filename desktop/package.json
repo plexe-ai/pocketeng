@@ -1,0 +1,28 @@
+{
+  "name": "pocketeng-desktop",
+  "version": "0.1.5",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Pocket Eng desktop app — Electron shell around console.pocketeng.ai",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "PE_DESKTOP_DEV=1 bun run build:ts && electron .",
+    "build:ts": "tsc -p tsconfig.json",
+    "test:unit": "bun run build:ts && node --test dist/main/deep-link-url.test.js dist/shared/platform.test.js",
+    "test:smoke": "bun run build:ts && node --test test/electron-smoke.mjs",
+    "build": "bun run build:ts && electron-builder --mac",
+    "build:unsigned": "bun run build:ts && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac -c.mac.identity=null --publish never",
+    "build:win:unsigned": "bun run build:win:x64:unsigned && bun run build:win:arm64:unsigned",
+    "build:win:x64:unsigned": "bun run build:ts && electron-builder --win --x64 --publish never",
+    "build:win:arm64:unsigned": "bun run build:ts && electron-builder --win --arm64 --publish never"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  }
+}

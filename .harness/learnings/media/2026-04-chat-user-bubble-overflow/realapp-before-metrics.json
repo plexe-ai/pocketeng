@@ -1,0 +1,30 @@
+{
+  "windowInnerWidth": 402,
+  "docScrollWidth": 402,
+  "docClientWidth": 402,
+  "feedScrollWidth": 1303,
+  "feedClientWidth": 402,
+  "wrapClass": "max-w-[85%]",
+  "wrapRect": {
+    "x": 74.3125,
+    "y": 24,
+    "width": 307.6875,
+    "height": 107.28125,
+    "top": 24,
+    "right": 382,
+    "bottom": 131.28125,
+    "left": 74.3125
+  },
+  "pClass": "text-[14px] leading-[1.6] whitespace-pre-wrap text-bright",
+  "pText": "Use this API key: sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "pRect": {
+    "x": 91.3125,
+    "y": 61.5,
+    "width": 273.6875,
+    "height": 44.78125,
+    "top": 61.5,
+    "right": 365,
+    "bottom": 106.28125,
+    "left": 91.3125
+  }
+}

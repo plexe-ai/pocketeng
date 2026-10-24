@@ -1,0 +1,13 @@
+node_modules/
+dist/
+out/
+*.log
+
+# Local env / signing secrets
+.env
+.env.local
+.env.*.local
+
+# Generated build assets (keep source icons; ignore rendered variants)
+build/mac-*/
+build/*.blockmap

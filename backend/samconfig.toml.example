@@ -1,0 +1,17 @@
+# PocketEngineer Backend — SAM Deploy Config
+# Copy to samconfig.toml and fill in your values.
+
+version = 0.1
+
+[default.global.parameters]
+stack_name = "pocketeng-backend"
+
+[default.deploy.parameters]
+region               = "us-east-1"
+capabilities         = "CAPABILITY_IAM"
+resolve_s3           = true
+no_confirm_changeset = true
+parameter_overrides  = "SupabaseUrl=https://yourproject.supabase.co SupabaseJwtSecret=your-jwt-secret-here SupabaseServiceRoleKey=your-service-role-key AppleClientId=com.example.app.web AppleTeamId=AB12C3D4E5 AppleKeyId=ABCDE12345 ApplePrivateKeyB64=base64-encoded-p8 PublicApiBaseUrl=https://api.pocketeng.co CompletionCallbackSecret=change-me ApnsPlatformApplicationArn=arn:aws:sns:us-east-1:123456789012:app/APNS/pocketeng-prod ApnsSandboxPlatformApplicationArn=arn:aws:sns:us-east-1:123456789012:app/APNS_SANDBOX/pocketeng-dev SlackSigningSecret=your-slack-signing-secret OpenaiApiKey=sk-proj-your-openai-key TrialAnthropicKey=sk-ant-api03-your-trial-key CloudflareApiToken=cfut_replace_me CloudflareAccountId=your-cf-account-id CloudflareZoneId=your-cf-zone-id CloudflarePreviewDomain=example.com CloudflareKvNamespaceId=your-kv-namespace-id CloudflarePreviewWorkerUrl=https://preview.example.com"
+
+[default.build.parameters]
+use_container = false

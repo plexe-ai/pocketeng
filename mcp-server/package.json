@@ -1,0 +1,14 @@
+{
+  "name": "pocket-engineer-mcp",
+  "version": "1.2.0",
+  "license": "Apache-2.0",
+  "description": "MCP server for Pocket Eng — sync code and manage sessions on EC2",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "pocket-engineer-mcp": "./index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

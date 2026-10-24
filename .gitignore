@@ -1,0 +1,93 @@
+# iOS test targets
+PocketEngineerTests/
+
+# Xcode project settings (contributors use their own Team ID)
+# PocketEngineer.xcodeproj/ is tracked — but xcuserdata inside is ignored
+scripts/
+
+# Xcode
+DerivedData/
+build/
+!desktop/build/
+!desktop/build/**
+*.xcuserdata
+*.xcworkspace
+xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Secrets / keys — NEVER commit these
+*.pem
+.env
+.env.local
+.env.*.local
+.env.test
+.env.prod
+.pocket-engineer/
+
+# Backend secrets (samconfig has parameter_overrides with real keys)
+backend/samconfig.toml
+backend/samconfig.test.toml
+
+# SAM build artifacts
+backend/.aws-sam/
+
+# Claude Code local settings (may contain OAuth secrets)
+.claude/settings.local.json
+.idea/
+
+# Handoff docs (generated, may contain session context)
+.handoff.md
+
+# Next.js build output
+.next/
+tsconfig.tsbuildinfo
+
+# Node
+node_modules/
+
+# Python bytecode caches (autopilot agents tend to commit these)
+__pycache__/
+*.pyc
+*.pyo
+
+# Log files (dev servers, etc)
+*.log
+
+# Throwaway demo / scratch artifacts agents like to leave behind
+demo-*.html
+IMPLEMENTATION_SUMMARY.md
+screenshots/
+
+# Browser-testing run outputs — see .harness/playbooks/browser-testing.md
+test-screenshots/
+test-results/
+
+# Archives
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.apk
+*.aab
+
+# Android
+web/android/.gradle/
+web/android/app/build/
+web/android/build/
+web/android/local.properties
+web/android/app/google-services.json
+
+# Dev docs (internal)
+DEVELOPMENT.md
+ExportOptions.plist
+.pr-body-draft.md
+
+# Agent worktrees (contain their own .claude/settings.local.json)
+.claude/worktrees/

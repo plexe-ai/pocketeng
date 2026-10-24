@@ -1,0 +1,43 @@
+---
+description: PocketEng engineering harness — required reading and closing evidence for every task
+alwaysApply: true
+---
+
+# Use the `.harness/` knowledge base
+
+This repo has a compact, self-maintained engineering knowledge base at `.harness/`. You are required to use it.
+
+## At the start of every task
+
+1. Read [`.harness/README.md`](mdc:.harness/README.md) — it is the single entry point.
+2. Follow the task-start routine in [`.harness/meta/read-protocol.md`](mdc:.harness/meta/read-protocol.md).
+3. Using the routing table in `.harness/README.md`, pick the **one** path that fits this task and read only those files (protocols + at most one playbook + relevant feature/learnings).
+4. Before writing any code, list in one line which harness files you read and which protocol phase (from `.harness/protocols/development-cycle.md`) you are entering.
+
+Do not pre-load the whole `.harness/` folder. The harness is designed for just-in-time navigation — read by need, not by volume.
+
+## While you work
+
+- Follow [`.harness/protocols/development-cycle.md`](mdc:.harness/protocols/development-cycle.md) for phase structure.
+- Follow [`.harness/protocols/safety-protocol.md`](mdc:.harness/protocols/safety-protocol.md) and [`.harness/references/operational-threat-model.md`](mdc:.harness/references/operational-threat-model.md) for anything touching real infra (AWS, Supabase, EC2, destructive DB ops, deploys).
+- If you are blocked, read [`.harness/protocols/no-bypass.md`](mdc:.harness/protocols/no-bypass.md) before inventing a workaround. Surface the block, don't silently route around it.
+- Do not mock the integration surface. Use real fixtures, real browser, real deploy — see [`.harness/protocols/testing-protocol.md`](mdc:.harness/protocols/testing-protocol.md).
+
+## Before saying "done"
+
+Follow [`.harness/meta/write-protocol.md`](mdc:.harness/meta/write-protocol.md):
+
+1. Produce **artifact-level evidence**, not prose: test output, linter exit codes, screenshots from the browser-testing playbook, deploy URL. "I ran the tests" is not evidence; the output is.
+2. Capture any new bug scar as a file under `.harness/learnings/` using the canonical template.
+3. If the protocol, testing rules, or safety rules themselves changed, flag it for human sign-off — those changes are not done unilaterally.
+4. Run `bash .harness/playbooks/harness-gardening.sh --strict` and report the result.
+
+## Commit and PR discipline
+
+- Commit only when the user asks.
+- Follow [`.harness/protocols/commit-and-pr-protocol.md`](mdc:.harness/protocols/commit-and-pr-protocol.md) for commit messages and PR evidence.
+- The pre-push hook (`verify-before-pr.sh`) is the backstop; it is not a suggestion. Do not add `--no-verify` or any flag that bypasses it — see [`.harness/protocols/no-bypass.md`](mdc:.harness/protocols/no-bypass.md).
+
+---
+
+*This rule is enforcement of the design captured in [`docs/harness-research.md`](mdc:docs/harness-research.md). If you think it is wrong for a specific task, say so in your plan and ask — do not quietly ignore it.*

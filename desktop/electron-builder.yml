@@ -1,0 +1,112 @@
+# Build config for packaging the Pocket Eng desktop app as a signed +
+# notarized universal DMG. Run via:
+#
+#   bun run build              # signed + notarized (requires env vars)
+#   bun run build:unsigned     # local smoke test, unsigned
+#
+# Required env vars for the signed path (consumed by electron-builder
+# automatically — do NOT put them in this file):
+#
+#   APPLE_ID                       the Apple ID email on your dev account
+#   APPLE_APP_SPECIFIC_PASSWORD    from appleid.apple.com, NOT the main pw
+#   APPLE_TEAM_ID                  AMRM9564A6  (shared with iOS shell)
+#
+# The signing identity itself is pulled from the login keychain — must be
+# a "Developer ID Application" cert (NOT "Apple Development", which only
+# works for Xcode-local builds). Without that cert, notarization and
+# Gatekeeper approval on end-user Macs will both fail.
+appId: com.pocketengineer.coder.desktop
+productName: Pocket Eng
+copyright: Copyright © 2026 Pocket Engineer
+
+directories:
+  buildResources: build
+  output: dist/release
+
+files:
+  - dist/**/*
+  # IMPORTANT: exclude dist/release/** — that's where electron-builder
+  # WRITES this DMG, so leaving it in `files` makes the next build pull
+  # the previous DMG into the new .app's Resources. Bug bites
+  # cumulatively: v0.1.2 was 200MB, v0.1.3 (with v0.1.2 inside) was 1.2GB,
+  # v0.1.4 would have been 1.4GB+ and so on. Caught after 0.1.3 first
+  # build; rebuild with this exclusion brought DMG back to expected size.
+  - '!dist/release/**'
+  - package.json
+  - '!**/*.map'
+
+mac:
+  category: public.app-category.developer-tools
+  # Hardened runtime is required for notarization. The entitlements file
+  # declares the minimum the app needs (allow-jit for V8, network client
+  # for API calls).
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # electron-builder runs `notarytool` automatically when the APPLE_ID /
+  # APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID env vars are present.
+  # Don't set `notarize: false` here — it was leftover from earlier
+  # local smoke tests and would suppress notarization even with env vars.
+  # Two DMGs (arm64 + x64) instead of one "universal" build — the
+  # @electron/universal merge step chokes when the two arch-specific
+  # app.asar files contain paths that differ ("not covered by allowList
+  # rule"). Per-arch DMGs avoid the merge entirely; electron-updater
+  # picks the correct one for each user automatically.
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  icon: build/icon.icns
+  # Register the pocketeng-desktop:// deep-link scheme so OAuth callbacks
+  # via `/auth/native-callback?client=desktop` route back into this window
+  # through macOS's open-url event.
+  extendInfo:
+    CFBundleURLTypes:
+      - CFBundleURLName: Pocket Engineer
+        CFBundleURLSchemes:
+          - pocketeng-desktop
+
+win:
+  icon: build/icon.ico
+  target: nsis
+
+nsis:
+  # The pinned electron-builder 25.x schema does not expose
+  # buildUniversalInstaller. The Windows scripts run separate x64 and arm64
+  # invocations instead, which avoids producing a multi-arch NSIS installer
+  # while Windows support is new.
+  artifactName: "${productName}-${version}-${arch}-Setup.${ext}"
+
+dmg:
+  # The DMG container itself stays unsigned; the .app inside it is the
+  # thing signed + notarized — that's what Gatekeeper inspects.
+  sign: false
+  window:
+    width: 540
+    height: 380
+  contents:
+    - x: 140
+      y: 200
+    - x: 400
+      y: 200
+      type: link
+      path: /Applications
+
+# Auto-update target. electron-updater fetches latest-mac.yml from this
+# repo's Releases page on app start and every 2h.
+#
+# We publish to a DEDICATED public-binaries repo, not the main code repo,
+# so that:
+#   1. End users can download without a GitHub login (plexe-ai/pocketeng is
+#      private; asset URLs 404 without auth)
+#   2. electron-updater's auto-update works over anonymous HTTP
+#   3. The main repo stays private while we're pre-launch
+# If the main repo ever goes public, we can just point this back at it
+# and auto-update picks up the new location on next release.
+publish:
+  provider: github
+  owner: plexe-ai
+  repo: pocketeng-releases
+  releaseType: release

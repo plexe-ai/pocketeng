@@ -1,0 +1,19 @@
+# Routes the verify-before-pr hook screenshots when web/ is in scope.
+# One path per line. '#' comments ignored.
+# The hook screenshots each at 1280×800 (desktop) + 390×844 (mobile iPhone).
+# Screenshots go to /tmp and must be opened with the Read tool before the PR
+# can proceed.
+#
+# Keep this list small — every route adds ~5s per viewport to PR creation
+# (warm-up curl + chromium virtual-time-budget wait). Add routes when a
+# feature touches them; remove when coverage is redundant.
+#
+# `/` = landing/sign-in. Universally renderable without a session.
+# `/dashboard` = main app. Redirects to sign-in when unauthenticated but
+# the redirect itself surfaces auth-state logic changes that `/` wouldn't
+# exercise. Left-off-by-default for session-gated routes like
+# `/dashboard/[id]` — add the specific id to this file if your change
+# touches them.
+
+/
+/dashboard

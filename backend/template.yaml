@@ -1,0 +1,2041 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: PocketEngineer managed server backend
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        SERVERS_TABLE: !Ref ServersTable
+        TEAMS_TABLE: !Ref TeamsTable
+        TEAM_MEMBERSHIPS_TABLE: !Ref TeamMembershipsTable
+        TEAM_INVITES_TABLE: !Ref TeamInvitesTable
+        KMS_KEY_ID: !Ref EncryptionKey
+        SUPABASE_URL: !Ref SupabaseUrl
+        SUPABASE_JWT_SECRET: !Ref SupabaseJwtSecret
+        # Shared Anthropic key used for the quick-start / trial flow — a
+        # user signing up for the first time can click one button and
+        # start chatting without having to paste their own API key.
+        # Substituted in provision.py ONLY when the request body has
+        # `trial: true` AND no user-provided anthropicApiKey. Empty string
+        # disables trial mode (the button will still work but the workspace
+        # won't have an agent credential until the user connects their own).
+        PE_TRIAL_ANTHROPIC_KEY: !Ref TrialAnthropicKey
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev]
+  DomainName:
+    Type: String
+    Default: api.pocketeng.co
+  SupabaseUrl:
+    Type: String
+    Description: Your Supabase project URL
+    Default: "https://yourproject.supabase.co"
+  SupabaseJwtSecret:
+    Type: String
+    Description: Supabase JWT secret for token verification
+    NoEcho: true
+    Default: "your-jwt-secret-here"
+  TrialAnthropicKey:
+    Type: String
+    Description: "Shared Anthropic API key for the quick-start trial flow. Used only when the provision request sets trial=true AND the user hasn't supplied their own key. Leave empty to disable trial mode."
+    NoEcho: true
+    Default: ""
+  SupabaseServiceRoleKey:
+    Type: String
+    Description: Supabase service role key for privileged auth admin operations
+    NoEcho: true
+    Default: ""
+  ResendApiKey:
+    Type: String
+    Description: |
+      Resend API key for transactional onboarding emails (workspace-ready
+      notification today; welcome / lifecycle later). When empty, email
+      sends are silently skipped — backend behavior unchanged.
+    NoEcho: true
+    Default: ""
+  ResendFrom:
+    Type: String
+    Description: |
+      Sender address for transactional emails, in RFC 5322 format
+      (e.g. "Pocket Eng <hello@pocketeng.ai>"). The domain must be
+      verified in Resend's dashboard with SPF / DKIM / DMARC records
+      live or sends will 422. Empty disables email.
+    Default: ""
+  UnsubscribeSecret:
+    Type: String
+    Description: |
+      HMAC secret used to mint and verify email unsubscribe tokens.
+      Generated once with `openssl rand -hex 32`. Rotating it
+      invalidates all previously-sent unsubscribe links — only do that
+      if you've reason to believe the old secret leaked.
+    NoEcho: true
+    Default: ""
+  AppleClientId:
+    Type: String
+    Description: Apple Sign in Services ID (client_id) used for token revocation
+    Default: ""
+  AppleTeamId:
+    Type: String
+    Description: Apple Developer Team ID used to sign the client secret JWT
+    Default: ""
+  AppleKeyId:
+    Type: String
+    Description: Apple Sign in key ID for the .p8 private key
+    Default: ""
+  ApplePrivateKeyB64:
+    Type: String
+    Description: Base64-encoded contents of the Apple Sign in .p8 private key
+    NoEcho: true
+    Default: ""
+  PublicApiBaseUrl:
+    Type: String
+    Description: Public HTTPS base URL used by remote completion callbacks
+    Default: ""
+  CompletionCallbackSecret:
+    Type: String
+    Description: Shared secret used by remote completion callbacks
+    NoEcho: true
+    Default: ""
+  ApnsPlatformApplicationArn:
+    Type: String
+    Description: SNS platform application ARN for production APNs
+    Default: ""
+  ApnsSandboxPlatformApplicationArn:
+    Type: String
+    Description: SNS platform application ARN for sandbox APNs
+    Default: ""
+  FcmPlatformApplicationArn:
+    Type: String
+    Description: SNS platform application ARN for FCM (Android push)
+    Default: ""
+  SlackSigningSecret:
+    Type: String
+    Description: Slack app signing secret (optional)
+    NoEcho: true
+    Default: ""
+  LinqApiKey:
+    Type: String
+    Description: Linq API bearer token for SMS
+    NoEcho: true
+    Default: ""
+  LinqFromNumber:
+    Type: String
+    Description: Linq sender phone number (E.164 format)
+    Default: ""
+  LinqSigningSecret:
+    Type: String
+    Description: Linq webhook signing secret
+    NoEcho: true
+    Default: ""
+  LinearWebhookSecret:
+    Type: String
+    Description: Linear webhook signing secret
+    NoEcho: true
+    Default: ""
+  OpenaiApiKey:
+    Type: String
+    Description: OpenAI API key — used for voice prompt transcription (Whisper)
+    NoEcho: true
+    Default: ""
+  LinearClientId:
+    Type: String
+    Description: Linear OAuth client ID (for app-level tokens)
+    Default: ""
+  LinearClientSecret:
+    Type: String
+    Description: Linear OAuth client secret
+    NoEcho: true
+    Default: ""
+  RetellWebhookSecret:
+    Type: String
+    Description: Shared secret that Retell includes on voice tool-call webhook URLs
+    NoEcho: true
+    Default: ""
+  CloudflareApiToken:
+    Type: String
+    Description: |
+      Cloudflare API token with these scopes:
+        - Cloudflare Tunnel: Edit     (tunnel CRUD)
+        - Zone → DNS: Edit            (per-workspace CNAME)
+        - Zone → Workers Routes: Edit (initial worker deploy only)
+        - Workers KV Storage: Edit    (workspace→tunnel map writes)
+        - Account: Read
+      Used by provision / chat / action to manage per-workspace
+      Cloudflare Tunnels, their CNAMEs, and the Workers-KV namespace
+      the preview proxy Worker reads. Empty disables the feature —
+      provision skips tunnel creation and preview URLs fall back to
+      the legacy /api/preview proxy.
+    NoEcho: true
+    Default: ""
+  CloudflareAccountId:
+    Type: String
+    Description: Cloudflare account ID that owns the preview tunnels.
+    Default: ""
+  CloudflareZoneId:
+    Type: String
+    Description: |
+      Zone id for the preview domain (e.g. zone id for `pocketeng.co`).
+      Every managed workspace gets ONE CNAME under this zone:
+      `w-<wsId>.<preview-domain>` → `<tunnelId>.cfargotunnel.com`.
+      Find it in the CF dashboard → Websites → pick domain → Overview.
+    Default: ""
+  CloudflarePreviewDomain:
+    Type: String
+    Description: |
+      Apex zone for per-workspace preview CNAMEs — e.g. `pocketeng.co`.
+      Combined with the `w-<wsId>` prefix to form the workspace public
+      hostname. Must be the domain whose zone id is in
+      CloudflareZoneId above.
+    Default: ""
+  CloudflareKvNamespaceId:
+    Type: String
+    Description: |
+      Workers-KV namespace id for the `workspaceId → tunnelId` map
+      that the `pe-preview-proxy` Worker reads. Create with
+      `wrangler kv:namespace create TUNNEL_MAP` from
+      `cloudflare-worker/preview-proxy/`; then paste the returned id
+      here AND into the Worker's `wrangler.toml`.
+    Default: ""
+  CloudflarePreviewWorkerUrl:
+    Type: String
+    Description: |
+      Public base URL of the deployed `pe-preview-proxy` Worker —
+      e.g. `https://preview.pocketeng.co`. Combined with
+      `{serverId}-{port}/` to form every managed-workspace preview
+      URL. Must match NEXT_PUBLIC_CLOUDFLARE_PREVIEW_WORKER_URL on
+      the frontend.
+    Default: ""
+
+Resources:
+  # ─── API Gateway ──────────────────────────────────────────────────────────────
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"]
+        AllowHeaders: ["Authorization", "Content-Type"]
+
+  # ─── Lambda Functions ─────────────────────────────────────────────────────────
+
+  ProvisionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.provision.handler
+      Description: Provision EC2 instance for managed user
+      Timeout: 60
+      Environment:
+        Variables:
+          AGENT_CREDENTIALS_TABLE: !Ref AgentCredentialsTable
+          # Name of the Lambda to async-invoke once provision records are
+          # saved. FinalizeFunction drives readiness → "ready".
+          FINALIZE_FUNCTION_NAME: !Ref FinalizeFunction
+          # Cloudflare Tunnel + KV config — used to create one tunnel
+          # per new workspace, write the `workspaceId → tunnelId`
+          # entry the preview Worker reads, and bake the connector
+          # token into userdata so the EC2 host brings up cloudflared
+          # on first boot. Empty values disable the feature entirely
+          # (provision will log + skip).
+          CLOUDFLARE_API_TOKEN: !Ref CloudflareApiToken
+          CLOUDFLARE_ACCOUNT_ID: !Ref CloudflareAccountId
+          CLOUDFLARE_ZONE_ID: !Ref CloudflareZoneId
+          CLOUDFLARE_PREVIEW_DOMAIN: !Ref CloudflarePreviewDomain
+          CLOUDFLARE_KV_NAMESPACE_ID: !Ref CloudflareKvNamespaceId
+          CLOUDFLARE_PREVIEW_WORKER_URL: !Ref CloudflarePreviewWorkerUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AgentCredentialsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:RunInstances
+                - ec2:CreateSecurityGroup
+                - ec2:AuthorizeSecurityGroupIngress
+                - ec2:ImportKeyPair
+                - ec2:DescribeImages
+                - ec2:CreateTags
+                - ec2:AllocateHosts
+                - ec2:DescribeInstanceTypeOfferings
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+              Resource: !GetAtt EncryptionKey.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt FinalizeFunction.Arn
+      Events:
+        Provision:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers
+            Method: POST
+
+  FinalizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.finalize.handler
+      Description: |
+        Drive a freshly-provisioned workspace to readiness.status="ready".
+        Invoked async by ProvisionFunction after put_server; also callable
+        directly via POST /servers/{id}/finalize for manual retries.
+      # Userdata + SSH wait + auth verify can take 2-3 minutes on a cold
+      # Amazon Linux 2023 boot. Keep well above _MAX_SECONDS in finalize.py.
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          AGENT_CREDENTIALS_TABLE: !Ref AgentCredentialsTable
+          # Used to look up user.email for the "workspace ready"
+          # transactional email. Same admin key account.py uses for
+          # account deletion. Email send is best-effort — finalize
+          # never fails if email errors.
+          SUPABASE_SERVICE_ROLE_KEY: !Ref SupabaseServiceRoleKey
+          # Resend (transactional email). Both empty in dev / pre-DNS
+          # environments — `email.send_email` no-ops cleanly when so.
+          RESEND_API_KEY: !Ref ResendApiKey
+          RESEND_FROM: !Ref ResendFrom
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AgentCredentialsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        # Manual retry — user can POST /servers/{id}/finalize if they
+        # reconnected an agent and want to re-run the auth verification.
+        FinalizeRetry:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/finalize
+            Method: POST
+
+  ServersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.servers.handler
+      Description: List all managed servers for authenticated user
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        ListServers:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers
+            Method: GET
+
+  StatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.status.handler
+      Description: Get managed server status and deliver SSH key
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        Status:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}
+            Method: GET
+        Heartbeat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/heartbeat
+            Method: POST
+
+  ActionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.action.handler
+      Description: Start/stop/terminate managed servers
+      Timeout: 15
+      Environment:
+        Variables:
+          # Needed by terminate to delete the workspace's Cloudflare
+          # tunnel + Workers-KV entry. Other actions ignore these.
+          CLOUDFLARE_API_TOKEN: !Ref CloudflareApiToken
+          CLOUDFLARE_ACCOUNT_ID: !Ref CloudflareAccountId
+          CLOUDFLARE_ZONE_ID: !Ref CloudflareZoneId
+          CLOUDFLARE_PREVIEW_DOMAIN: !Ref CloudflarePreviewDomain
+          CLOUDFLARE_KV_NAMESPACE_ID: !Ref CloudflareKvNamespaceId
+          CLOUDFLARE_PREVIEW_WORKER_URL: !Ref CloudflarePreviewWorkerUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:StartInstances
+                - ec2:StopInstances
+                - ec2:TerminateInstances
+                - ec2:DeleteSecurityGroup
+                - ec2:DeleteKeyPair
+                - ec2:ReleaseHosts
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        Action:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/action
+            Method: POST
+
+  ChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.chat.handler
+      Description: Chat with coding agents via SSH
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          PUSH_DEVICES_TABLE: !Ref PushDevicesTable
+          PUBLIC_API_BASE_URL: !Ref PublicApiBaseUrl
+          COMPLETION_CALLBACK_SECRET: !Ref CompletionCallbackSecret
+          APNS_PLATFORM_APPLICATION_ARN: !Ref ApnsPlatformApplicationArn
+          APNS_SANDBOX_PLATFORM_APPLICATION_ARN: !Ref ApnsSandboxPlatformApplicationArn
+          FCM_PLATFORM_APPLICATION_ARN: !Ref FcmPlatformApplicationArn
+          LINEAR_CLIENT_ID: !Ref LinearClientId
+          LINEAR_CLIENT_SECRET: !Ref LinearClientSecret
+          HARNESS_RUN_SUMMARIES_TABLE: !Ref HarnessRunSummariesTable
+          HARNESS_SUGGESTIONS_TABLE: !Ref HarnessSuggestionsTable
+          HARNESS_RUN_SUMMARIES_TABLE: !Ref HarnessRunSummariesTable
+          HARNESS_SUGGESTIONS_TABLE: !Ref HarnessSuggestionsTable
+          AGENT_CREDENTIALS_TABLE: !Ref AgentCredentialsTable
+          # Cloudflare Tunnel + KV config — _discover_services
+          # registers a per-port ingress rule on the tunnel and (for
+          # pre-migration workspaces without a tunnelId) lazy-creates
+          # a tunnel, installs cloudflared via SSH, and writes the
+          # workspace's KV entry so the preview Worker can find it.
+          CLOUDFLARE_API_TOKEN: !Ref CloudflareApiToken
+          CLOUDFLARE_ACCOUNT_ID: !Ref CloudflareAccountId
+          CLOUDFLARE_ZONE_ID: !Ref CloudflareZoneId
+          CLOUDFLARE_PREVIEW_DOMAIN: !Ref CloudflarePreviewDomain
+          CLOUDFLARE_KV_NAMESPACE_ID: !Ref CloudflareKvNamespaceId
+          CLOUDFLARE_PREVIEW_WORKER_URL: !Ref CloudflarePreviewWorkerUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PushDevicesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessRunSummariesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessSuggestionsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AgentCredentialsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: "*"
+      Events:
+        Chat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/chat
+            Method: POST
+
+  HarnessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.harness.handler
+      Description: Harness suggestions, history, and live rules
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          HARNESS_RUN_SUMMARIES_TABLE: !Ref HarnessRunSummariesTable
+          HARNESS_SUGGESTIONS_TABLE: !Ref HarnessSuggestionsTable
+          HARNESS_VERSIONS_TABLE: !Ref HarnessVersionsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessRunSummariesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessSuggestionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessVersionsTable
+      Events:
+        ListHarness:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /harness
+            Method: GET
+        UpdateHarness:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /harness
+            Method: POST
+
+  SessionEventsReadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.session_events_read.handler
+      Description: Read session events via cursor polling (client-facing)
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+          SESSION_EVENTS_TABLE: !Ref SessionEventsTable
+          SUPABASE_URL: !Ref SupabaseUrl
+          SUPABASE_JWT_SECRET: !Ref SupabaseJwtSecret
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref SessionEventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+      Events:
+        ReadEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /sessions/{sessionId}/events
+            Method: GET
+
+  SessionEventsIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.session_events_ingest.handler
+      Description: Ingest a batch of session events from the agent-bridge uploader
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          SESSION_EVENTS_TABLE: !Ref SessionEventsTable
+          PUSH_DEVICES_TABLE: !Ref PushDevicesTable
+          COMPLETION_CALLBACK_SECRET: !Ref CompletionCallbackSecret
+          APNS_PLATFORM_APPLICATION_ARN: !Ref ApnsPlatformApplicationArn
+          APNS_SANDBOX_PLATFORM_APPLICATION_ARN: !Ref ApnsSandboxPlatformApplicationArn
+          FCM_PLATFORM_APPLICATION_ARN: !Ref FcmPlatformApplicationArn
+          LINEAR_CLIENT_ID: !Ref LinearClientId
+          LINEAR_CLIENT_SECRET: !Ref LinearClientSecret
+          # Needed for _notify_voice — SMSes a voice caller when run.finished
+          # fires and _complete_session_and_notify fans out.
+          LINQ_API_KEY: !Ref LinqApiKey
+          LINQ_FROM_NUMBER: !Ref LinqFromNumber
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionEventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PushDevicesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessRunSummariesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessSuggestionsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: "*"
+      Events:
+        IngestEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /internal/sessions/{sessionId}/events
+            Method: POST
+
+  CompletionHookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.completion_hook.handler
+      Description: Finalize a session run from the remote completion callback
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          PUSH_DEVICES_TABLE: !Ref PushDevicesTable
+          COMPLETION_CALLBACK_SECRET: !Ref CompletionCallbackSecret
+          APNS_PLATFORM_APPLICATION_ARN: !Ref ApnsPlatformApplicationArn
+          APNS_SANDBOX_PLATFORM_APPLICATION_ARN: !Ref ApnsSandboxPlatformApplicationArn
+          FCM_PLATFORM_APPLICATION_ARN: !Ref FcmPlatformApplicationArn
+          LINEAR_CLIENT_ID: !Ref LinearClientId
+          LINEAR_CLIENT_SECRET: !Ref LinearClientSecret
+          # Needed for _notify_voice — SMSes a voice caller when their
+          # phone-initiated session finishes.
+          LINQ_API_KEY: !Ref LinqApiKey
+          LINQ_FROM_NUMBER: !Ref LinqFromNumber
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PushDevicesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessRunSummariesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessSuggestionsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: "*"
+      Events:
+        CompletionHook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /internal/sessions/{sessionId}/complete
+            Method: POST
+
+  SessionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.sessions.handler
+      Description: List sessions and messages for chat history
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          SESSION_EVENTS_TABLE: !Ref SessionEventsTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionEventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+      Events:
+        ListSessions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/sessions
+            Method: GET
+        GetMessages:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /sessions/{sessionId}/messages
+            Method: GET
+        DeleteSession:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /sessions/{sessionId}
+            Method: DELETE
+        RenameSession:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /sessions/{sessionId}
+            Method: PATCH
+
+  DebugLogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.debug_log.handler
+      Description: Authenticated client log forwarder; lets TestFlight builds emit logs to CloudWatch (Safari Web Inspector is disabled on distribution-signed apps).
+      Events:
+        DebugLog:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /debug/log
+            Method: POST
+
+  PushDevicesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.push_devices.handler
+      Description: Register and unregister push devices (iOS APNs and Android FCM)
+      Environment:
+        Variables:
+          PUSH_DEVICES_TABLE: !Ref PushDevicesTable
+          APNS_PLATFORM_APPLICATION_ARN: !Ref ApnsPlatformApplicationArn
+          APNS_SANDBOX_PLATFORM_APPLICATION_ARN: !Ref ApnsSandboxPlatformApplicationArn
+          FCM_PLATFORM_APPLICATION_ARN: !Ref FcmPlatformApplicationArn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PushDevicesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:CreatePlatformEndpoint
+                - sns:SetEndpointAttributes
+                - sns:DeleteEndpoint
+              Resource: "*"
+      Events:
+        RegisterPushDevice:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /devices/push
+            Method: POST
+        UnregisterPushDevice:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /devices/push
+            Method: DELETE
+
+  AccountFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.account.handler
+      Description: Permanently delete an authenticated account and associated data
+      Environment:
+        Variables:
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          SESSION_EVENTS_TABLE: !Ref SessionEventsTable
+          PUSH_DEVICES_TABLE: !Ref PushDevicesTable
+          HARNESS_RUN_SUMMARIES_TABLE: !Ref HarnessRunSummariesTable
+          HARNESS_SUGGESTIONS_TABLE: !Ref HarnessSuggestionsTable
+          HARNESS_VERSIONS_TABLE: !Ref HarnessVersionsTable
+          OAUTH_CREDENTIALS_TABLE: !Ref OAuthCredentialsTable
+          SLACK_MAPPINGS_TABLE: !Ref SlackMappingsTable
+          LINEAR_MAPPINGS_TABLE: !Ref LinearMappingsTable
+          SMS_MAPPINGS_TABLE: !Ref SmsMappingsTable
+          SUPABASE_SERVICE_ROLE_KEY: !Ref SupabaseServiceRoleKey
+          APPLE_CLIENT_ID: !Ref AppleClientId
+          APPLE_TEAM_ID: !Ref AppleTeamId
+          APPLE_KEY_ID: !Ref AppleKeyId
+          APPLE_PRIVATE_KEY_B64: !Ref ApplePrivateKeyB64
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionEventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PushDevicesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessRunSummariesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessSuggestionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessVersionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OAuthCredentialsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamInvitesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SlackMappingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LinearMappingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SmsMappingsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:TerminateInstances
+                - ec2:DeleteSecurityGroup
+                - ec2:DeleteKeyPair
+                - ec2:ReleaseHosts
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:DeleteEndpoint
+              Resource: "*"
+      Events:
+        DeleteAccount:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account
+            Method: DELETE
+
+  WelcomeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.welcome.handler
+      Description: |
+        POST /account/welcome — fire onboarding welcome email once per
+        user, gated by Supabase user_metadata.welcomeEmailSent. Called
+        by the web /onboarding page on mount; no-op when RESEND_API_KEY
+        is unset (silent dev / pre-DNS environments).
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          SUPABASE_SERVICE_ROLE_KEY: !Ref SupabaseServiceRoleKey
+          RESEND_API_KEY: !Ref ResendApiKey
+          RESEND_FROM: !Ref ResendFrom
+      Events:
+        WelcomeEmail:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/welcome
+            Method: POST
+
+  TrialUsageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.trial_usage.handler
+      Description: GET /account/trial-usage - count sessions on trial workspaces
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          # SERVERS_TABLE flows in via Globals.Function.Environment.
+          SESSIONS_TABLE: !Ref SessionsTable
+      Policies:
+        # Handler is read-only (Query against two GSIs). Holding at
+        # CRUD here so the deployed role lines up with the rest of the
+        # stack's pattern; tighten to DynamoDBReadPolicy in a followup
+        # once we've also flipped ScheduledEmailNudge back to Read,
+        # since both downgrades will hit the EarlyValidation hook
+        # together and we want to do them in one deploy.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+      Events:
+        GetTrialUsage:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/trial-usage
+            Method: GET
+
+  EmailUnsubscribeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.email_unsubscribe.handler
+      Description: |
+        GET /email/unsubscribe?token=<hmac> — public unauthenticated
+        endpoint embedded in non-transactional emails. Validates the
+        HMAC token against UNSUBSCRIBE_SECRET, sets
+        user_metadata.emailUnsubscribed, returns a friendly HTML page.
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          SUPABASE_SERVICE_ROLE_KEY: !Ref SupabaseServiceRoleKey
+          UNSUBSCRIBE_SECRET: !Ref UnsubscribeSecret
+      Events:
+        Unsubscribe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /email/unsubscribe
+            Method: GET
+
+  ScheduledEmailNudgeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.scheduled_email_nudge.handler
+      # Lambda Description is capped at 256 chars by the API and the
+      # AWS::EarlyValidation::PropertyValidation account hook rejects
+      # the whole change set (with no diagnostic detail) when this
+      # exceeds it. The longer rationale lives in the handler module
+      # docstring; keep this one-liner.
+      Description: 24h activity-nudge tick - emails users whose workspace is ready but haven't sent any sessions yet. Idempotent via user_metadata.nudgeEmailSent. Capped at 100 sends per tick.
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SERVERS_TABLE: !Ref ServersTable
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          SUPABASE_SERVICE_ROLE_KEY: !Ref SupabaseServiceRoleKey
+          RESEND_API_KEY: !Ref ResendApiKey
+          RESEND_FROM: !Ref ResendFrom
+          UNSUBSCRIBE_SECRET: !Ref UnsubscribeSecret
+          PUBLIC_API_BASE_URL: !Ref PublicApiBaseUrl
+      Policies:
+        # Should be DynamoDBReadPolicy (the handler is read-only — Scan
+        # servers, Query sessions, no writes), but the deployed role
+        # was created yesterday with DynamoDBCrudPolicy as a workaround
+        # for the AWS::EarlyValidation::PropertyValidation account hook.
+        # That CRUD state is now what's in prod, so any deploy that
+        # tries to downgrade it to ReadPolicy makes the hook reject the
+        # whole change set with no diagnostic detail. Holding it at
+        # CRUD here so deploys go through. Followup: figure out what
+        # the hook actually objects to about the downgrade and trim
+        # back. Tracked under the hook investigation note in the
+        # TrialUsageFunction block below.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            # Every hour. Most users don't sit perfectly on a 24h
+            # boundary; the scan + filter loop handles ranges naturally.
+            # Disabled on first deploy so we can sanity-check the
+            # idempotency before letting it loose.
+            Schedule: rate(1 hour)
+            Description: |
+              Tick the 24h activity-nudge sender. Re-enable via the SAM
+              template (Enabled: true) or the EventBridge console.
+            Enabled: false
+
+  OAuthCredentialsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.oauth_credentials.handler
+      Description: Store provider tokens needed for future account cleanup
+      Environment:
+        Variables:
+          OAUTH_CREDENTIALS_TABLE: !Ref OAuthCredentialsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OAuthCredentialsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        StoreOAuthCredentials:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/oauth-credentials
+            Method: POST
+
+  AgentCredentialsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.agent_credentials.handler
+      Description: Store agent credential bundles (Claude OAuth, Codex auth, Cursor key) imported from the user's local machine
+      Environment:
+        Variables:
+          AGENT_CREDENTIALS_TABLE: !Ref AgentCredentialsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AgentCredentialsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        StoreAgentCredentials:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/agent-credentials
+            Method: POST
+        ListAgentCredentials:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/agent-credentials
+            Method: GET
+        DeleteAgentCredentials:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/agent-credentials
+            Method: DELETE
+
+  AwsCredentialsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.aws_credentials.handler
+      Description: Store the user's AWS access key for BYO-AWS provisioning (secret is KMS-encrypted)
+      Environment:
+        Variables:
+          AWS_CREDENTIALS_TABLE: !Ref AwsCredentialsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AwsCredentialsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        StoreAwsCredentials:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/aws-credentials
+            Method: POST
+        GetAwsCredentials:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/aws-credentials
+            Method: GET
+        DeleteAwsCredentials:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /account/aws-credentials
+            Method: DELETE
+
+  TeamFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.team.handler
+      Description: Team lifecycle, membership, and invite management
+      Environment:
+        Variables:
+          # Resend (transactional email). Both empty in dev / pre-DNS
+          # environments — `email.send_email` no-ops cleanly when so.
+          # The inviter is rendered from the JWT email claim, so we
+          # deliberately do NOT wire SUPABASE_SERVICE_ROLE_KEY in here
+          # (welcome / finalize need it for display names; we don't).
+          RESEND_API_KEY: !Ref ResendApiKey
+          RESEND_FROM: !Ref ResendFrom
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamInvitesTable
+      Events:
+        CreateTeam:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /teams
+            Method: POST
+        GetOwnTeam:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /teams/me
+            Method: GET
+        UpdateTeam:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /teams/{teamId}
+            Method: PATCH
+        ListTeamInvites:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /teams/{teamId}/invites
+            Method: GET
+        CreateTeamInvite:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /teams/{teamId}/invites
+            Method: POST
+        UpdateTeamMember:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /teams/{teamId}/members/{userId}
+            Method: PATCH
+        DeleteTeamMember:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /teams/{teamId}/members/{userId}
+            Method: DELETE
+
+  TeamInvitesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.team_invites.handler
+      Description: View and accept pending team invites
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TeamInvitesTable
+      Events:
+        GetPendingTeamInvites:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /team-invites
+            Method: GET
+        AcceptTeamInvite:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /team-invites/{inviteId}/accept
+            Method: POST
+
+  UploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.upload.handler
+      Description: Upload a file to an EC2 instance via SFTP
+      Timeout: 30
+      MemorySize: 256
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        Upload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/upload
+            Method: POST
+
+  TranscribeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.transcribe.handler
+      Description: Transcribe a voice prompt via OpenAI Whisper
+      # Whisper round-trip is usually 1-3s for short prompts but can
+      # spike on the first invocation after a cold start. 30s leaves
+      # generous headroom without being a footgun for runaway calls.
+      Timeout: 30
+      # Most of the work is a single HTTP round-trip; memory is only
+      # needed to hold the base64 blob + decoded bytes (capped at 25MB).
+      MemorySize: 512
+      Environment:
+        Variables:
+          OPENAI_API_KEY: !Ref OpenaiApiKey
+      Events:
+        Transcribe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /transcribe
+            Method: POST
+
+  RepoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.repo.handler
+      Description: Browse files and git status for a server workspace
+      Timeout: 30
+      MemorySize: 256
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        Repo:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/repo
+            Method: GET
+
+  RepoDownloadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.repo_download.handler
+      Description: Download a file from a server workspace (binary-safe, 100 MB cap)
+      Timeout: 120
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref SessionsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        RepoDownload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/repo/download
+            Method: GET
+
+  GitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.git.handler
+      Description: Git operations (diff, log, commit, create-pr) on a server workspace
+      Timeout: 30
+      MemorySize: 256
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        Git:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /servers/{serverId}/git
+            Method: POST
+
+  # ─── Slack Integration ────────────────────────────────────────────────────────
+
+  SlackCommandFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.slack_command.handler
+      Description: Receive Slack slash commands and dispatch to worker
+      Timeout: 5
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref SlackWorkerFunction
+          SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt SlackWorkerFunction.Arn
+      Events:
+        SlackCommand:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /slack/command
+            Method: POST
+
+  SlackEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.slack_events.handler
+      Description: Receive Slack Events API (app_mention) and dispatch to worker
+      Timeout: 5
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref SlackWorkerFunction
+          SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
+          SLACK_MAPPINGS_TABLE: !Ref SlackMappingsTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SlackMappingsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt SlackWorkerFunction.Arn
+      Events:
+        SlackEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /slack/events
+            Method: POST
+
+  SlackRegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.slack_register.handler
+      Description: Register Slack team to PE user mapping
+      Timeout: 10
+      Environment:
+        Variables:
+          SLACK_MAPPINGS_TABLE: !Ref SlackMappingsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SlackMappingsTable
+      Events:
+        Register:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /slack/register
+            Method: POST
+
+  SlackWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.slack_worker.handler
+      Description: Async worker — SSH into env, run Claude Code, post to Slack
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SLACK_MAPPINGS_TABLE: !Ref SlackMappingsTable
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          AGENT_CREDENTIALS_TABLE: !Ref AgentCredentialsTable
+          PUBLIC_API_BASE_URL: !Ref PublicApiBaseUrl
+          COMPLETION_CALLBACK_SECRET: !Ref CompletionCallbackSecret
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SlackMappingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        # Read-only access to team-auth tables — _launch_turn calls
+        # can_manage_owned_resource → is_team_admin for team-owned workspaces.
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TeamMembershipsTable
+        # Read-only access for the agent-credentials sync on turn launch.
+        - DynamoDBReadPolicy:
+            TableName: !Ref AgentCredentialsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:StartInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+
+  # ─── Linear Integration ──────────────────────────────────────────────────────
+
+  LinearWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.linear_webhook.handler
+      Description: Receive Linear webhook events and dispatch to worker
+      Timeout: 5
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref LinearWorkerFunction
+          LINEAR_WEBHOOK_SECRET: !Ref LinearWebhookSecret
+          LINEAR_MAPPINGS_TABLE: !Ref LinearMappingsTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref LinearMappingsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt LinearWorkerFunction.Arn
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /linear/webhook
+            Method: POST
+
+  LinearRegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.linear_register.handler
+      Description: Register Linear team to PE user mapping
+      Timeout: 15
+      Environment:
+        Variables:
+          LINEAR_MAPPINGS_TABLE: !Ref LinearMappingsTable
+          PUBLIC_API_BASE_URL: !Ref PublicApiBaseUrl
+          LINEAR_WEBHOOK_SECRET: !Ref LinearWebhookSecret
+          LINEAR_CLIENT_ID: !Ref LinearClientId
+          LINEAR_CLIENT_SECRET: !Ref LinearClientSecret
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LinearMappingsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        Register:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /linear/register
+            Method: POST
+
+  LinearWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.linear_worker.handler
+      Description: Async worker — fetch Linear issue, SSH into env, run Claude Code
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          LINEAR_MAPPINGS_TABLE: !Ref LinearMappingsTable
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          PUBLIC_API_BASE_URL: !Ref PublicApiBaseUrl
+          COMPLETION_CALLBACK_SECRET: !Ref CompletionCallbackSecret
+          LINEAR_CLIENT_ID: !Ref LinearClientId
+          LINEAR_CLIENT_SECRET: !Ref LinearClientSecret
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LinearMappingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:StartInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+
+  # ─── SMS (Linq) Integration ─────────────────────────────────────────────────
+
+  SmsInboundFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.sms_inbound.handler
+      Description: Receive inbound SMS via Linq webhook, dispatch to worker
+      Timeout: 5
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref SmsWorkerFunction
+          SMS_MAPPINGS_TABLE: !Ref SmsMappingsTable
+          LINQ_API_KEY: !Ref LinqApiKey
+          LINQ_SIGNING_SECRET: !Ref LinqSigningSecret
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SmsMappingsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt SmsWorkerFunction.Arn
+      Events:
+        SmsInbound:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /sms/inbound
+            Method: POST
+
+  SmsRegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.sms_register.handler
+      Description: Register phone number + default server for SMS
+      Timeout: 10
+      Environment:
+        Variables:
+          SMS_MAPPINGS_TABLE: !Ref SmsMappingsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SmsMappingsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ServersTable
+      Events:
+        Register:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /sms/register
+            Method: POST
+
+  SmsWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.sms_worker.handler
+      Description: Async worker — SSH into env, run Claude Code, reply via SMS
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SMS_MAPPINGS_TABLE: !Ref SmsMappingsTable
+          LINQ_API_KEY: !Ref LinqApiKey
+          LINQ_FROM_NUMBER: !Ref LinqFromNumber
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SmsMappingsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:StartInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+
+  # ─── Voice (Retell AI) Integration ───────────────────────────────────────────
+
+  VoiceToolsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.voice_tools.handler
+      Description: Retell AI webhook — list/read/send for voice-agent tool calls
+      # 60s gives us room for SSH handshake + _launch_turn. Retell's default
+      # tool timeout is lower, so the caller will hear a "hmm, one sec" fill
+      # if we go over; we should keep the common case under 3s.
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SMS_MAPPINGS_TABLE: !Ref SmsMappingsTable
+          SESSIONS_TABLE: !Ref SessionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          PUSH_DEVICES_TABLE: !Ref PushDevicesTable
+          AGENT_CREDENTIALS_TABLE: !Ref AgentCredentialsTable
+          HARNESS_RUN_SUMMARIES_TABLE: !Ref HarnessRunSummariesTable
+          HARNESS_SUGGESTIONS_TABLE: !Ref HarnessSuggestionsTable
+          PUBLIC_API_BASE_URL: !Ref PublicApiBaseUrl
+          COMPLETION_CALLBACK_SECRET: !Ref CompletionCallbackSecret
+          RETELL_WEBHOOK_SECRET: !Ref RetellWebhookSecret
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SmsMappingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref PushDevicesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AgentCredentialsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessRunSummariesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref HarnessSuggestionsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:StartInstances
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: !GetAtt EncryptionKey.Arn
+      Events:
+        VoiceRetell:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /voice/retell
+            Method: POST
+
+  LifecycleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src.lifecycle.handler
+      Description: Auto-stop idle instances
+      Timeout: 120
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServersTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:StopInstances
+                - ec2:TerminateInstances
+                - ec2:DeleteSecurityGroup
+                - ec2:DeleteKeyPair
+                - ec2:DescribeInstances
+                - ec2:ReleaseHosts
+              Resource: "*"
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Check for idle servers every 5 minutes
+            Enabled: false
+
+  # ─── DynamoDB Tables ──────────────────────────────────────────────────────────
+
+  ServersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-servers-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: serverId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: teamId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: serverId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: teamId-createdAt-index
+          KeySchema:
+            - AttributeName: teamId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  TeamsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-teams-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: teamId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: teamId
+          KeyType: HASH
+
+  TeamMembershipsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-team-memberships-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: teamId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: teamId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: teamId-userId-index
+          KeySchema:
+            - AttributeName: teamId
+              KeyType: HASH
+            - AttributeName: userId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  TeamInvitesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-team-invites-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: inviteId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: teamId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: inviteId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-createdAt-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: teamId-createdAt-index
+          KeySchema:
+            - AttributeName: teamId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  SlackMappingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-slack-mappings-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: slackTeamId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: slackTeamId
+          KeyType: HASH
+
+  SmsMappingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-sms-mappings-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: phoneNumber
+          AttributeType: S
+      KeySchema:
+        - AttributeName: phoneNumber
+          KeyType: HASH
+
+  LinearMappingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-linear-mappings-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: linearTeamId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: linearTeamId
+          KeyType: HASH
+
+  HarnessRunSummariesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-harness-runs-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+
+  HarnessSuggestionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-harness-suggestions-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+
+  HarnessVersionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-harness-versions-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: versionSeq
+          AttributeType: N
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: versionSeq
+          KeyType: RANGE
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-sessions-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: serverId
+          AttributeType: S
+        - AttributeName: updatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: serverId-updatedAt-index
+          KeySchema:
+            - AttributeName: serverId
+              KeyType: HASH
+            - AttributeName: updatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-messages-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: seq
+          AttributeType: N
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+        - AttributeName: seq
+          KeyType: RANGE
+
+  SessionEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-session-events-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: seq
+          AttributeType: N
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+        - AttributeName: seq
+          KeyType: RANGE
+
+  PushDevicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-push-devices-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: installationId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: updatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: installationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: userId-updatedAt-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: updatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  OAuthCredentialsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-oauth-credentials-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: provider
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: provider
+          KeyType: RANGE
+
+  AgentCredentialsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-agent-credentials-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: agent
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: agent
+          KeyType: RANGE
+
+  AwsCredentialsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pe-aws-credentials-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  # ─── KMS Key ─────────────────────────────────────────────────────────────────
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: PocketEngineer — encrypts SSH keys and API keys at rest
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/pocketeng
+      TargetKeyId: !Ref EncryptionKey
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway URL
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  ServersTableName:
+    Value: !Ref ServersTable
+  PushDevicesTableName:
+    Value: !Ref PushDevicesTable
+  KmsKeyId:
+    Value: !Ref EncryptionKey

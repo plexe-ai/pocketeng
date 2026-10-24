@@ -1,0 +1,15 @@
+.vercel
+samconfig.test.toml
+
+# Deploy configs carry secrets in parameter_overrides / env — never commit.
+sam.config.toml
+sam.config.toml.bak.*
+temp.sam.config.toml
+temp.sam.config.toml.bak.*
+env.push.local
+.env.push.local
+env.fcm.local
+.env.fcm.local
+
+# Real Slack channel routing (copy channel_mappings.example.json)
+tools/channel_mappings.json

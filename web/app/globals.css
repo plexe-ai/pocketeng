@@ -1,0 +1,536 @@
+@import "tailwindcss";
+
+@theme {
+  /* Font */
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+
+  /* ── Light palette (default) ── */
+  --color-ink:       var(--ink);
+  --color-l1:        var(--l1);
+  --color-l2:        var(--l2);
+  --color-l3:        var(--l3);
+  --color-l4:        var(--l4);
+  --color-bright:    var(--bright);
+  --color-secondary: var(--text-secondary);
+  --color-tertiary:  var(--text-tertiary);
+  --color-line:      var(--line);
+
+  /* Accents (shared) */
+  --color-accent:  #55C6E5;
+  --color-amber:   #f59e0b;
+  --color-danger:  #ef4444;
+  --color-purple:  #8b5cf6;
+  --color-green:   #22c55e;
+
+  /* Surfaces */
+  --color-card:        var(--card-bg);
+  --color-card-hover:  var(--card-hover);
+  --color-card-border: var(--card-border);
+
+  /* Animation */
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ── Safe area insets (Capacitor / PWA) ── */
+:root {
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
+}
+
+/* ── Kill iOS rubber-band overscroll on the document ──
+   Without this, dragging on a route whose layout pins itself to
+   `h-dvh overflow-hidden` (the dashboard shell) can still produce
+   document-level overscroll in WKWebView, briefly exposing whatever was
+   painted behind — most visibly the previous route (e.g. the landing /
+   sign-in page) when the WebView is holding stale HTML. Scoped to
+   html+body so route-internal scrollers (chat feed, lists) are still
+   free to behave normally. */
+html, body {
+  overscroll-behavior: none;
+}
+
+/* ── Theme tokens: Light ── */
+:root {
+  --ink:            #ffffff;
+  --l1:             #f7f7f8;
+  --l2:             #f0f0f2;
+  --l3:             #e8e8ec;
+  --l4:             #dddde3;
+  --bright:         #1a1a2e;
+  --text-secondary: #52525b;
+  --text-tertiary:  #71717a;
+  --line:           rgba(0, 0, 0, 0.06);
+  --card-bg:        rgba(0, 0, 0, 0.04);
+  --card-hover:     rgba(0, 0, 0, 0.06);
+  --card-border:    rgba(0, 0, 0, 0.10);
+  --scrollbar-thumb: rgba(0, 0, 0, 0.1);
+  --scrollbar-hover: rgba(0, 0, 0, 0.18);
+  --selection-bg:   rgba(85, 198, 229, 0.2);
+  --selection-color: #1a1a2e;
+  --glass-bg:       rgba(255, 255, 255, 0.7);
+  --glass-border:   rgba(0, 0, 0, 0.06);
+  --hover-bg:       rgba(0, 0, 0, 0.04);
+  --active-bg:      rgba(0, 0, 0, 0.06);
+  --sidebar-bg:     #ffffff;
+  --topbar-bg:      #ffffff;
+  --user-bubble:    #1a1a2e;
+  --user-bubble-text: #ffffff;
+  --code-bg:        #0d1117;
+  --code-text:      #c9d1d9;
+  --code-prompt:    #7ee787;
+  --code-muted:     #8b949e;
+  --code-error:     #f85149;
+  --diff-add-bg:    #f0fdf4;
+  --diff-add-text:  #166534;
+  --diff-add-mark:  #16a34a;
+  --diff-del-bg:    #fef2f2;
+  --diff-del-text:  #991b1b;
+  --diff-del-mark:  #dc2626;
+  --skeleton-from:  rgba(0, 0, 0, 0.04);
+  --skeleton-mid:   rgba(0, 0, 0, 0.07);
+  color-scheme: light;
+}
+
+/* ── Theme tokens: Dark ── */
+.dark {
+  --ink:            #0a0a0f;
+  --l1:             #111118;
+  --l2:             #18181f;
+  --l3:             #222230;
+  --l4:             #2e2e3e;
+  --bright:         #e4e4e8;
+  --text-secondary: #a1a1aa;
+  --text-tertiary:  #82828c;
+  --line:           rgba(255, 255, 255, 0.08);
+  --card-bg:        rgba(255, 255, 255, 0.03);
+  --card-hover:     rgba(255, 255, 255, 0.05);
+  --card-border:    rgba(255, 255, 255, 0.08);
+  --scrollbar-thumb: rgba(255, 255, 255, 0.1);
+  --scrollbar-hover: rgba(255, 255, 255, 0.18);
+  --selection-bg:   rgba(85, 198, 229, 0.25);
+  --selection-color: #e4e4e8;
+  --glass-bg:       rgba(10, 10, 15, 0.8);
+  --glass-border:   rgba(255, 255, 255, 0.06);
+  --hover-bg:       rgba(255, 255, 255, 0.04);
+  --active-bg:      rgba(255, 255, 255, 0.07);
+  --sidebar-bg:     #0e0e14;
+  --topbar-bg:      #0e0e14;
+  --user-bubble:    #1c1c28;
+  --user-bubble-text: #e4e4e8;
+  --code-bg:        #0d1117;
+  --code-text:      #c9d1d9;
+  --code-prompt:    #7ee787;
+  --code-muted:     #8b949e;
+  --code-error:     #f85149;
+  --diff-add-bg:    rgba(22, 163, 74, 0.1);
+  --diff-add-text:  #4ade80;
+  --diff-add-mark:  #22c55e;
+  --diff-del-bg:    rgba(239, 68, 68, 0.1);
+  --diff-del-text:  #fca5a5;
+  --diff-del-mark:  #ef4444;
+  --skeleton-from:  rgba(255, 255, 255, 0.04);
+  --skeleton-mid:   rgba(255, 255, 255, 0.07);
+  color-scheme: dark;
+}
+
+/* ── Scrollbar ── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+*::-webkit-scrollbar { width: 4px; height: 4px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 2px; }
+*::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
+
+/* ── Selection ── */
+::selection { background: var(--selection-bg); color: var(--selection-color); }
+
+/* ── Focus ring ── */
+:focus-visible {
+  outline: 2px solid rgba(85, 198, 229, 0.5);
+  outline-offset: 2px;
+}
+
+/* The composer textarea gets its focus signal from the surrounding
+   container's bg darkening (see ChatWindow.tsx `.composer` class). A
+   second outline on the textarea itself is visually redundant and makes
+   the chat input feel boxy. Keeping the global a11y outline for every
+   other focusable element — this is scoped to just the composer. */
+.composer textarea:focus,
+.composer textarea:focus-visible {
+  outline: none;
+}
+
+/* ── Reduced motion ── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Animations ── */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes scale-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+@keyframes gradient-shift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* ── Utility classes ── */
+.animate-fade-in { animation: fade-in 0.4s var(--ease-spring) both; }
+.animate-fade-in-up { animation: fade-in-up 0.5s var(--ease-spring) both; }
+.animate-scale-in { animation: scale-in 0.3s var(--ease-spring) both; }
+
+/* Stagger children */
+.stagger > * { animation: fade-in 0.35s var(--ease-spring) both; }
+.stagger > *:nth-child(1) { animation-delay: 0ms; }
+.stagger > *:nth-child(2) { animation-delay: 50ms; }
+.stagger > *:nth-child(3) { animation-delay: 100ms; }
+.stagger > *:nth-child(4) { animation-delay: 150ms; }
+.stagger > *:nth-child(5) { animation-delay: 200ms; }
+.stagger > *:nth-child(6) { animation-delay: 250ms; }
+
+/* Skeleton shimmer */
+.skeleton {
+  background: linear-gradient(90deg, var(--skeleton-from) 25%, var(--skeleton-mid) 50%, var(--skeleton-from) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+/* Glass surface */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+}
+
+/* Interactive card */
+.card-surface {
+  background: var(--ink);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.card-surface:hover {
+  border-color: var(--line);
+  box-shadow: 0 4px 24px var(--card-hover);
+}
+
+/* Button base */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 10px;
+  transition: all 0.2s var(--ease-spring);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.btn:active:not(:disabled) { transform: scale(0.97); }
+
+.btn-primary {
+  background: #55C6E5;
+  color: #ffffff;
+  height: 40px;
+  padding: 0 20px;
+  box-shadow: 0 2px 12px rgba(85, 198, 229, 0.25);
+}
+.btn-primary:hover:not(:disabled) {
+  background: #3fbad9;
+  box-shadow: 0 4px 24px rgba(85, 198, 229, 0.35);
+  transform: translateY(-1px);
+}
+
+.btn-secondary {
+  background: var(--l1);
+  color: var(--text-secondary);
+  border: 1px solid var(--card-border);
+  height: 40px;
+  padding: 0 18px;
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--l2);
+  color: var(--bright);
+  border-color: var(--line);
+  box-shadow: 0 2px 12px var(--card-hover);
+}
+
+.btn-apple {
+  background: #000000;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  height: 40px;
+  padding: 0 18px;
+}
+.btn-apple:hover:not(:disabled) {
+  background: #111111;
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.16);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.22);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  height: 40px;
+  padding: 0 14px;
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--hover-bg);
+  color: var(--bright);
+}
+
+.btn-danger {
+  background: rgba(239, 68, 68, 0.08);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.15);
+  height: 40px;
+  padding: 0 18px;
+}
+.btn-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.14);
+  box-shadow: 0 2px 12px rgba(239, 68, 68, 0.1);
+}
+
+.btn-accent-outline {
+  background: rgba(85, 198, 229, 0.06);
+  color: #55C6E5;
+  border: 1px solid rgba(85, 198, 229, 0.2);
+  height: 40px;
+  padding: 0 18px;
+}
+.btn-accent-outline:hover:not(:disabled) {
+  background: rgba(85, 198, 229, 0.12);
+  border-color: rgba(85, 198, 229, 0.35);
+  box-shadow: 0 2px 12px rgba(85, 198, 229, 0.1);
+}
+
+.btn-sm {
+  height: 34px;
+  padding: 0 14px;
+  font-size: 12px;
+  border-radius: 8px;
+}
+
+/* Input base */
+.input {
+  width: 100%;
+  height: 44px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--bright);
+  background: var(--ink);
+  border: 1px solid var(--card-border);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.input::placeholder { color: var(--text-tertiary); }
+.input:focus {
+  outline: none;
+  border-color: rgba(85, 198, 229, 0.5);
+  box-shadow: 0 0 0 3px rgba(85, 198, 229, 0.1);
+}
+
+@media (max-width: 767px) {
+  .input {
+    height: 44px;
+    font-size: 16px;
+  }
+
+  .btn-sm {
+    height: 38px;
+  }
+}
+
+/* Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 6px;
+  line-height: 1.4;
+}
+
+/* Gradient background for pages */
+.page-gradient { position: relative; }
+.page-gradient::before {
+  content: '';
+  position: fixed;
+  top: -30%;
+  right: -20%;
+  width: 600px;
+  height: 600px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(85, 198, 229, 0.04) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Divider with text */
+.divider-text { display: flex; align-items: center; gap: 12px; }
+.divider-text::before, .divider-text::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* ── Alive state — animated gradient border for running environments ── */
+@keyframes border-glow {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+.alive-border { position: relative; }
+.alive-border::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, rgba(85,198,229,0.35), rgba(85,198,229,0.08), rgba(85,198,229,0.25));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: border-glow 3s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* Ambient glow behind status dots */
+.glow-green { box-shadow: 0 0 12px rgba(34,197,94,0.4), 0 0 4px rgba(34,197,94,0.6); }
+.glow-amber { box-shadow: 0 0 12px rgba(245,158,11,0.4), 0 0 4px rgba(245,158,11,0.6); }
+
+/* Press scale for interactive elements */
+.press-scale { transition: transform 0.15s var(--ease-spring); }
+.press-scale:active { transform: scale(0.97); }
+
+/* Hover lift */
+.hover-lift { transition: transform 0.2s var(--ease-spring), box-shadow 0.2s ease; }
+.hover-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 30px var(--card-hover);
+}
+
+/* ── Dark mode logo fixes ── */
+/* SVG logos need to be inverted in dark mode when used as <img> tags
+   because currentColor doesn't work across document boundaries */
+.dark img[src*="/logos/openai.svg"],
+.dark img[src*="/logos/cursor.svg"] {
+  filter: brightness(0) saturate(100%) invert(1);
+}
+
+/* ── ChangePanel diff viewer (react-diff-view) theming ────────────────────── */
+/* Scoped under .pe-diff so we don't leak into any other page. */
+.pe-diff .diff {
+  background: transparent;
+  font-family: var(--font-mono);
+  border-collapse: collapse;
+  width: 100%;
+}
+.pe-diff .diff-code {
+  padding: 0 0.75rem;
+  white-space: pre;
+  color: var(--text-secondary);
+}
+.pe-diff .diff-line:hover { background: var(--l1); }
+
+.pe-diff .diff-code-insert { background: var(--diff-add-bg); color: var(--diff-add-text); }
+.pe-diff .diff-code-delete { background: var(--diff-del-bg); color: var(--diff-del-text); }
+.pe-diff .diff-hunk-header { background: transparent; }
+.pe-diff .diff-hunk-header-content {
+  padding: 0.25rem 0.75rem;
+  color: var(--color-accent);
+  background: rgba(85,198,229,0.08);
+  font-size: 11px;
+}
+
+/* Line-number gutter */
+.pe-diff .diff-gutter {
+  width: 3.25rem;
+  padding: 0 0.5rem 0 0.75rem;
+  color: var(--text-tertiary);
+  background: var(--l1);
+  text-align: right;
+  user-select: none;
+  border-right: 1px solid var(--color-line, rgba(255,255,255,0.05));
+  font-size: 10px;
+  opacity: 0.55;
+}
+.pe-diff .diff-gutter:hover { opacity: 1; }
+.pe-diff .diff-gutter-insert { background: var(--diff-add-bg); color: var(--diff-add-text); opacity: 0.85; }
+.pe-diff .diff-gutter-delete { background: var(--diff-del-bg); color: var(--diff-del-text); opacity: 0.85; }
+.pe-diff .diff-gutter-omit { background: var(--l1); }
+
+/* Word-level edit marks within a changed line — darker accent than the row bg. */
+.pe-diff .diff-code-edit-insert { background: var(--diff-add-mark); color: #fff; border-radius: 2px; padding: 0 2px; }
+.pe-diff .diff-code-edit-delete { background: var(--diff-del-mark); color: #fff; border-radius: 2px; padding: 0 2px; text-decoration: line-through; text-decoration-color: rgba(255,255,255,0.4); }
+
+/* Prism token coloring — minimal, works in both light + dark via currentColor mixing. */
+.pe-diff .token.comment,
+.pe-diff .token.prolog,
+.pe-diff .token.doctype,
+.pe-diff .token.cdata { color: var(--text-tertiary); font-style: italic; }
+.pe-diff .token.punctuation { color: var(--text-tertiary); }
+.pe-diff .token.property,
+.pe-diff .token.tag,
+.pe-diff .token.boolean,
+.pe-diff .token.number,
+.pe-diff .token.constant,
+.pe-diff .token.symbol { color: var(--color-amber); }
+.pe-diff .token.selector,
+.pe-diff .token.attr-name,
+.pe-diff .token.string,
+.pe-diff .token.char,
+.pe-diff .token.builtin,
+.pe-diff .token.inserted { color: var(--color-green); }
+.pe-diff .token.operator,
+.pe-diff .token.entity,
+.pe-diff .token.url,
+.pe-diff .token.variable { color: var(--color-secondary); }
+.pe-diff .token.atrule,
+.pe-diff .token.attr-value,
+.pe-diff .token.function,
+.pe-diff .token.class-name { color: var(--color-accent); }
+.pe-diff .token.keyword { color: var(--color-purple); }
+.pe-diff .token.regex,
+.pe-diff .token.important { color: var(--color-danger); }
+
+/* ── SDLC pipeline (dashboard/sdlc) ────────────────────────────────────
+   Flowing-gradient connector used while a workflow run hands off between
+   stages. The gradient is provided inline (role colors); this just slides
+   it. One keyframe, shared by every connector. */
+@keyframes pe-flow {
+  to { background-position: -200% 0; }
+}

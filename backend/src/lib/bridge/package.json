@@ -1,0 +1,11 @@
+{
+  "name": "pe-bridge-local",
+  "version": "0.0.0-internal",
+  "license": "Apache-2.0",
+  "private": true,
+  "description": "Internal — do not publish. Shipped to EC2 workspaces by the backend.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
